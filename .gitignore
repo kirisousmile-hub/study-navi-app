@@ -2,13 +2,21 @@
 .env
 *.env
 env_unused/
+<<<<<<< HEAD
 ECHO ÇÕ <ON> Ç≈Ç∑ÅB
+=======
+ECHO ÔøΩÔøΩ <ON> ÔøΩ≈ÇÔøΩÔøΩB
+>>>>>>> ec433a6 (update study navi app)
 # python
 __pycache__/
 *.pyc
 .venv/
 venv/
+<<<<<<< HEAD
 ECHO ÇÕ <ON> Ç≈Ç∑ÅB
+=======
+ECHO ÔøΩÔøΩ <ON> ÔøΩ≈ÇÔøΩÔøΩB
+>>>>>>> ec433a6 (update study navi app)
 # app temp and generated
 tmp_uploads/
 vectorstore_main/
@@ -16,3 +24,8 @@ vectorstore_registry/
 review_cards.json
 wall_memory.json
 *.log
+<<<<<<< HEAD
+=======
+# data (PDF„Å™„Å©)
+data/
+>>>>>>> ec433a6 (update study navi app)
