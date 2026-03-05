@@ -20,6 +20,10 @@ from typing import List, Tuple
 import streamlit as st
 from dotenv import load_dotenv
 
+APP_TITLE = "学習ナビ（最小版）"
+# # なぜ：Streamlitの設定は最初に1回だけ（UI表示の前提）
+st.set_page_config(page_title=APP_TITLE, layout="wide")
+
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_community.document_loaders import (
@@ -39,7 +43,7 @@ from docx import Document as DocxDocument
 # 1) CONSTANTS / KEYS
 ############################################
 # # なぜ：Streamlitは上から順に実行。キー/定数は「どこでも参照できる」ように最上段で固定
-APP_TITLE = "学習ナビ（最小版）"
+
 
 # ディレクトリ
 PERSIST_DIR = "vectorstore_main"       # # なぜ：Chromaの本体DB保存先（run_idで分割）
@@ -637,12 +641,9 @@ def detect_mode(user_text: str) -> str:
 # 8) UI
 ############################################
 
-# # なぜ：Streamlitの設定は最初に1回だけ（UI表示の前提）
-st.set_page_config(page_title=APP_TITLE, layout="wide")
 
 
-# # なぜ：Streamlitの設定は最初に1回だけ（UI表示の前提）
-st.set_page_config(page_title=APP_TITLE, layout="wide")
+
 
 st.write("RUN_ID =", get_run_id())
 st.write("MAIN_DIR =", get_main_dir())
