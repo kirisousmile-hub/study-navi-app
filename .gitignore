@@ -1,14 +1,18 @@
 # secrets
+data/
+vectorstore_main/
+vectorstore_registry/
+.env
 .env
 *.env
 env_unused/
-
+ECHO �� <ON> �ł��B
 # python
 __pycache__/
 *.pyc
 .venv/
 venv/
-
+ECHO �� <ON> �ł��B
 # app temp and generated
 tmp_uploads/
 vectorstore_main/
@@ -16,24 +20,3 @@ vectorstore_registry/
 review_cards.json
 wall_memory.json
 *.log
-
-# --- local data / db / cache ---
-data/
-*.json
-qlite/
-*.sqlite
-*.sqlite3
-
-# --- python ---
-__pycache__/
-*.pyc
-.venv/
-
-# --- streamlit ---
-.streamlit/secrets.toml
-
-# --- chroma (よくある) ---
-chroma/
-vectorstore*/
-tmp_uploads/
-logs/
