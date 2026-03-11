@@ -13,6 +13,7 @@ import traceback
 import json
 import re
 import uuid
+import random
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Tuple
@@ -73,6 +74,32 @@ WALL_STEP_KEY = "wall_step"             # 1..4
 WALL_HYP_KEY = "wall_hypothesis"        # STEP1の仮説
 WALL_REV_KEY = "wall_revision"          # STEP3の修正版
 WALL_CONC_KEY = "wall_conclusion"       # 収束結果（STEP4）
+
+QUESTION_FLOW = [
+    "具体例を考える質問",
+    "仕組みを理解する質問",
+    "理由を説明する質問",
+    "応用して考える質問"
+]
+
+############################################
+# ENV
+############################################
+
+load_dotenv()
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+############################################
+# LLM
+############################################
+
+llm = ChatOpenAI(
+    model=MODEL_NAME,
+    temperature=0.3,
+    api_key=OPENAI_API_KEY
+)
 
 ############################################
 # 2) UTILITIES (small)
@@ -173,6 +200,23 @@ def count_turns(history: list) -> tuple[int, int]:
     turn_count = msg_count // 2
     return turn_count, msg_count
 
+def summarize_history(history):
+    """履歴が長くなりすぎたとき要約する"""
+
+    if len(history) < 12:
+        return history
+
+    text = "\n".join([m["content"] for m in history[-10:]])
+
+    prompt = f"""
+次の会話を3行で要約してください。
+
+{text}
+"""
+
+    summary = llm.invoke(prompt).content
+
+    return [{"role": "system", "content": "これまでの会話要約:\n" + summary}]
 
 def make_retrieve_key(hypothesis: str, top_k: int, filter_opt: dict | None = None) -> str:
     payload = {
@@ -267,21 +311,31 @@ def generate_chunk_id(doc: Document) -> str:
 ############################################
 # 4) DB / REGISTRY
 ############################################
+RUN_ID_FILE = Path("run_id.txt")
+
 def get_run_id() -> str:
-    """# なぜ：DB領域をrun単位で分け、完全初期化を簡単にする"""
+
+    # すでにsessionにある場合
     rid = st.session_state.get(RUN_ID_KEY)
     if rid:
         return rid
+
+    # ファイルがある場合
+    if RUN_ID_FILE.exists():
+        rid = RUN_ID_FILE.read_text().strip()
+        st.session_state[RUN_ID_KEY] = rid
+        return rid
+
+    # 新規作成
     rid = hashlib.md5(os.urandom(16)).hexdigest()[:8]
+    RUN_ID_FILE.write_text(rid)
+
     st.session_state[RUN_ID_KEY] = rid
     return rid
 
 def get_main_dir() -> str:
-
-    """# なぜ：run_idごとにベクトルDBを分ける（初期化で詰まらない）"""
     return str(Path(PERSIST_DIR) / get_run_id())
 
-    return str(Path(PERSIST_DIR))
 
 def get_registry_dir() -> str:
     """# なぜ：run_idごとにregistryも分ける（初期化で詰まらない）"""
@@ -324,30 +378,56 @@ def has_main_index() -> bool:
         return False
 
 def build_or_update_vectorstore(all_docs: List[Document]) -> Chroma:
-    """# なぜ：既存DBに追加しつつ、persistして永続化する"""
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small", api_key=OPENAI_API_KEY)
-    db = Chroma(persist_directory=get_main_dir(), embedding_function=embeddings)
+
+    embeddings = OpenAIEmbeddings(
+        model="text-embedding-3-small",
+        api_key=OPENAI_API_KEY
+    )
+
+    db = Chroma(
+        persist_directory=get_main_dir(),
+        embedding_function=embeddings
+    )
 
     if not all_docs:
         return db
 
     ids = [generate_chunk_id(doc) for doc in all_docs]
-    if not ids:
-        return db
 
-    db.add_documents(all_docs, ids=ids)
+    batch_size = 50
 
-    # # なぜ：環境差でpersistが無い/例外になるケースに備えつつ、基本は永続化する
+    for i in range(0, len(all_docs), batch_size):
+
+        batch_docs = all_docs[i:i+batch_size]
+        batch_ids = ids[i:i+batch_size]
+
+        db.add_documents(batch_docs, ids=batch_ids)
+
     try:
-
         db.persist()
-
-        get_run_id()
     except Exception:
         pass
 
     return db
 
+def rag_quality_check(query: str, hits: List[Document]) -> str:
+
+    if not hits:
+        return "検索結果なし"
+
+    text = hits[0].page_content.lower()
+
+    keywords = query.lower().split()
+
+    score = sum(1 for k in keywords if k in text)
+
+    if score == 0:
+        return "⚠ 検索が質問とズレている可能性"
+
+    if score == 1:
+        return "△ やや弱い"
+
+    return "◎ 良好"
 
 ############################################
 # 5) RAG (answer_with_rag)
@@ -364,11 +444,13 @@ def answer_with_rag(question: str, k: int = 4, only_textbook: bool = False) -> T
     raw_hits = retriever.get_relevant_documents(question)
     hits = unique_by_source_page(raw_hits, int(k))
 
+    rag_status = rag_quality_check(question, hits)
+    st.caption(f"RAG評価: {rag_status}")
+
     context = "\n\n".join(
         [f"[{i}] {format_source_page(d.metadata)}\n{d.page_content}" for i, d in enumerate(hits, start=1)]
     )
 
-    llm = ChatOpenAI(model=MODEL_NAME, temperature=0.2, api_key=OPENAI_API_KEY)
 
     prompt = f"""あなたは「学習ナビ」です。
 以下の「参照コンテキスト」だけに基づいて回答してください。
@@ -449,30 +531,41 @@ def pick_anchor_term(hits) -> str:
 ############################################
 # 7) COACH (wall)
 ############################################
+def detect_intent(user_text: str) -> str:
+    """
+    ユーザーの意図をLLMで判定
+    question / stuck / discussion の3種類
+    """
 
+    prompt = f"""
+ユーザーの発言の意図を分類してください。
+
+分類は次の3つだけ：
+
+question     = 質問している
+stuck        = 理解できていない / ヒントが欲しい
+discussion   = 仮説や意見を言っている（壁打ち）
+
+ユーザー発言:
+{user_text}
+
+答えは次のどれか1語だけで返してください：
+
+question
+stuck
+discussion
+"""
+
+    result = llm.invoke(prompt).content.strip().lower()
+
+    if "stuck" in result:
+        return "stuck"
+    if "question" in result:
+        return "question"
+    return "discussion"
 
 def handle_help_stage(user_text: str, anchor: str) -> str | None:
-    stage = st.session_state.get("HELP_STAGE", 0)
-
-    if stage == 1:
-        # ユーザーがコピペしてきた前提で受け取る
-        st.session_state["HELP_COPIED_SENTENCE"] = user_text.strip()
-        st.session_state["HELP_STAGE"] = 2
-        return (
-            "OK、その1文を受け取った。\n\n"
-            "【次】その内容を“あなたの言葉で”1〜2文に言い換えてください（用語は残してOK）。"
-        )
-
-    if stage == 2:
-        copied = st.session_state.get("HELP_COPIED_SENTENCE", "")
-        st.session_state["HELP_STAGE"] = 0
-        return (
-            "ナイス。最後に確認。\n\n"
-            f"元の1文：{copied}\n"
-            f"あなたの言い換え：{user_text.strip()}\n\n"
-            "この言い換えを『仮説』に反映して、STEP3へ行こう。"
-        )
-
+    # 一旦無効化（壁打ちの会話を優先する）
     return None
 
 def override_next_step(msg: str, anchor: str) -> str:
@@ -490,17 +583,8 @@ def override_next_step(msg: str, anchor: str) -> str:
         out.append(fixed)
     return "\n".join(out)
 
-def is_user_stuck(text: str) -> bool:
-    t = (text or "").strip().lower()
 
-    # 追加：確認質問への短答は「まだ詰まってる」扱いにする
-    if t in ["yes", "no", "y", "n", "はい", "いいえ"]:
-        return True
-
-    triggers = ["わからない", "わかりません", "理解できない", "教えて", "答え", "どこ見", "何すれば"]
-    return any(x in t for x in triggers)
-
-def coach_help_reply(user_text: str, hits, wall_mode: str, MODEL_NAME: str, OPENAI_API_KEY: str, hypothesis: str, last_check: str = "") -> str:
+def coach_help_reply(user_text: str, hits, wall_mode: str, hypothesis: str, last_check: str = "") -> str:
     # sources候補（表示用）
     srcs = [format_source_page(d.metadata) for d in (hits or [])][:2]
     src_line = "\n".join([f"sources[{i+1}] = {s}" for i, s in enumerate(srcs)]) if srcs else "(sourcesなし)"
@@ -546,7 +630,6 @@ def coach_help_reply(user_text: str, hits, wall_mode: str, MODEL_NAME: str, OPEN
 【次の一手】は必ず sources[1] を使い、キーワード「{anchor}」を含める。
 形式：sources[1]の「{anchor}」を探して、見つけた“1文”をそのままコピペして。
 """
-    llm = ChatOpenAI(model=MODEL_NAME, temperature=0.2, api_key=OPENAI_API_KEY)
     raw = llm.invoke(prompt).content.strip()
     return raw
 
@@ -590,49 +673,126 @@ def retrieve_hits(query: str, k: int = 5, only_textbook: bool = True) -> List[Do
         search_kwargs["filter"] = {"category": "textbook"}
     retriever = db.as_retriever(search_kwargs=search_kwargs)
 
-    raw_hits = retriever.get_relevant_documents(query)
-
     raw_hits = retriever.invoke(query)
 
     return unique_by_source_page(raw_hits, int(k))
 
+def generate_question(hypothesis: str) -> str:
+
+    if "question_step" not in st.session_state:
+        st.session_state.question_step = 0
+
+    step = min(
+        st.session_state.get("question_step", 0),
+        len(QUESTION_FLOW) - 1
+    )
+
+    question_type = QUESTION_FLOW[step]
+
+    # ★すでに取得済みのRAG結果を使う
+    hits = st.session_state.get(WALL_HITS_KEY, [])
+
+    context = "\n\n".join([
+        d.page_content[:600] for d in hits
+    ])
+
+    prompt = f"""
+あなたはPython講師です。
+
+ユーザーの仮説と教材を参考に
+理解を深める質問を1つ作ってください。
+
+ユーザー仮説
+{hypothesis}
+
+教材
+{context}
+
+質問タイプ
+{question_type}
+
+ルール
+・テーマに関する質問
+・答えは言わない
+・質問は1つ
+・Python学習の質問
+"""
+
+    result = llm.invoke(prompt).content.strip()
+
+    st.session_state.question_step += 1
+
+    if st.session_state.question_step >= len(QUESTION_FLOW):
+        st.session_state.question_step = len(QUESTION_FLOW) - 1
+
+    return result
+
+def evaluate_answer(user_answer: str, hypothesis: str) -> str:
+
+    prompt = f"""
+あなたはPython講師です。
+
+ユーザー仮説
+{hypothesis}
+
+ユーザー回答
+{user_answer}
+
+次の形式で短く返してください
+
+【評価】
+回答が正しい方向か
+
+【ヒント】
+理解を深めるヒント（1文）
+"""
+
+    return llm.invoke(prompt).content
+
 def coach_reply(history: list, hits: List[Document], mode: str) -> str:
-    """# なぜ：答えを与えすぎず、質問で理解を深める壁打ちコーチ"""
-    llm = ChatOpenAI(model=MODEL_NAME, temperature=0.2, api_key=OPENAI_API_KEY)
-    sources = "\n".join([f"- {format_source_page(d.metadata)}" for d in hits[:3]]) or "- (なし)"
+	"""# なぜ：答えを与えすぎず、質問で理解を深める壁打ちコーチ"""
 
-    if mode.startswith("A"):
-        role_rule = """あなたはPython復習コーチ。短い一言 + 質問3つ + 必要なら根拠候補（最大3つ）。"""
-    elif mode.startswith("C"):
-        role_rule = """あなたはPythonコード読解コーチ。短い一言 + 質問3つ + 必要なら根拠候補（最大3つ）。"""
-    else:
-        role_rule = """あなたは設計コーチ。短い一言 + 質問3つ + 必要なら根拠候補（最大3つ）。"""
-
-    messages = [SystemMessage(content=f"""{role_rule}
-共通ルール：
-- 長文解説は禁止（ユーザーが「解説して」と言った時だけ）
-- 保存メモ（永続）は前提にして良い
-- 根拠候補は sources にある範囲だけ
-""")]
-
-    messages.append(SystemMessage(content=f"【保存メモ（永続）】\n{build_memory_block(limit=30)}"))
-
-    recent = history[-(TURN_LIMIT * 2):]
-    for m in recent:
-        if m.get("role") == "user":
-            messages.append(HumanMessage(content=m.get("content", "")))
-        elif m.get("role") == "assistant":
-            messages.append(AIMessage(content=m.get("content", "")))
-
-    messages.append(SystemMessage(content=f"根拠候補（sources）:\n{sources}"))
-    return llm.invoke(messages).content
+	sources = "\n".join(
+		[f"- {format_source_page(d.metadata)}" for d in hits[:3]]
+	) or "- (なし)"
 
 
-def detect_mode(user_text: str) -> str:
-    t = (user_text or "").strip()
-    if any(x in t for x in ["わからない", "教えて", "理解できない", "意味が", "ヒント"]):
-        return "help"
-    return "coach"
+	role_rule = """
+あなたは学習コーチです。
+
+目的
+ユーザーが自分で理解に到達すること。
+
+ルール
+・答えを教えない
+・質問中心で会話
+・説明は2文以内
+・最後は必ず質問
+"""
+
+	messages = [SystemMessage(content=role_rule)]
+
+	messages.append(SystemMessage(content=f"【保存メモ（永続）】\n{build_memory_block(limit=30)}"))
+
+	recent = summarize_history(history) + history[-6:]
+
+	for m in recent:
+		if m.get("role") == "user":
+			messages.append(HumanMessage(content=m.get("content", "")))
+		elif m.get("role") == "assistant":
+			messages.append(AIMessage(content=m.get("content", "")))
+
+	messages.append(SystemMessage(content=f"根拠候補（sources）:\n{sources}"))
+
+	messages.append(SystemMessage(content="""
+回答形式：
+
+1 要約
+2 必要なら短い説明
+3 最後に質問を1つ
+"""))
+
+	return llm.invoke(messages).content
 
 
 
@@ -654,10 +814,7 @@ st.session_state.setdefault("HELP_LAST_CHECK", "")
 st.session_state.setdefault("HELP_STAGE", 0)  # 0=通常 / 1=コピペ待ち / 2=言い換え待ち
 
 
-# # なぜ：環境変数を読み込んでAPIキーとモデル名を決める
-load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
 
 st.title(APP_TITLE)
 st.caption("アップロードしたあなたのメモ/提出物を元に、根拠つきで回答し、次の一手を3つ提案します。")
@@ -671,6 +828,9 @@ ensure_dirs()
 # 壁打ち履歴（初期化）
 if WALL_KEY not in st.session_state:
     st.session_state[WALL_KEY] = []
+
+if "question_step" not in st.session_state:
+    st.session_state.question_step = 0
 
 
 #早期収束
@@ -700,17 +860,25 @@ with st.sidebar:
         st.session_state["just_reset"] = False
 
     if st.button("🧨 完全初期化（DB + registry + tmp）"):
-        shutil.rmtree(get_main_dir(), ignore_errors=True)
-        shutil.rmtree(get_registry_dir(), ignore_errors=True)
+        shutil.rmtree(PERSIST_DIR, ignore_errors=True)
+        shutil.rmtree(REGISTRY_DIR, ignore_errors=True)
         shutil.rmtree(TMP_UPLOAD_DIR, ignore_errors=True)
+
+            # ★追加：run_id削除
+        if RUN_ID_FILE.exists():
+            RUN_ID_FILE.unlink()
+
+        Path(PERSIST_DIR).mkdir(parents=True, exist_ok=True)
+        Path(REGISTRY_DIR).mkdir(parents=True, exist_ok=True)
         Path(TMP_UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
 
-        st.session_state[RUN_ID_KEY] = hashlib.md5(os.urandom(16)).hexdigest()[:8]
         for k in ["retriever", "db"]:
             st.session_state.pop(k, None)
 
-        st.success("DB/registry/tmp を完全初期化しました。")
+        st.success("DB / registry / tmp を完全初期化しました。")
         st.rerun()
+
+    st.caption("※インデックスを作り直したいときだけ押してください")
 
     st.divider()
     st.header("① データ投入")
@@ -1031,8 +1199,11 @@ with colL:
             {"role": "user", "content": user_msg}
         )
 
+        # ★検索クエリは仮説を優先
+        query = st.session_state.get(WALL_HYP_KEY, user_msg)
+
         hits = retrieve_hits(
-            user_msg,
+            query,
             k=int(wall_k),
             only_textbook=wall_only_textbook
         )
@@ -1087,6 +1258,7 @@ with colL:
                         st.warning("仮説が空です。1行でいいので書いてください。")
                     else:
                         st.session_state[WALL_HYP_KEY] = hyp.strip()
+                        st.session_state.question_step = 0
                         st.session_state[WALL_KEY].append({"role": "user", "content": f"【仮説】\n{hyp.strip()}"})
 
                         st.session_state.pop(WALL_HITS_KEY, None)
@@ -1158,50 +1330,51 @@ with colL:
                 height=120,
             )
 
+            user_text = user_follow
+
             colq1, colq2 = st.columns(2)
 
             with colq1:
                 if st.button("🗣 送信して掘る", key="step2_follow_send"):
+
                     user_text = (user_follow or "").strip()
+
                     if not user_text:
                         st.warning("空です（1行でOK）")
                         st.stop()
 
-                    st.session_state[WALL_KEY].append({"role": "user", "content": user_text})
+                    # ユーザー発言保存
+                    st.session_state[WALL_KEY].append({
+                        "role": "user",
+                        "content": user_text
+                    })
 
-                    hyp = st.session_state.get(WALL_HYP_KEY, "")
-                    anchor = pick_anchor_term(hits)
+                    # 回答評価
+                    assistant_eval = evaluate_answer(
+                        user_text,
+                        st.session_state.get(WALL_HYP_KEY, "")
+                    )
 
-                    # HELP_STAGE中ならLLMを呼ばず進める
-                    stage_msg = handle_help_stage(user_text, anchor)
-                    if stage_msg is not None:
-                        st.session_state[WALL_KEY].append({"role": "assistant", "content": stage_msg})
-                        st.session_state["step2_follow_nonce"] += 1
-                        st.rerun()
+                    # 次の質問も生成
+                    next_q = generate_question(
+                        st.session_state.get(WALL_HYP_KEY, "")
+                    )
 
-                    # “詰まり”ならHELP
-                    if is_user_stuck(user_text):
-                        assistant_msg = coach_help_reply(
-                            user_text,
-                            hits,
-                            wall_mode,
-                            MODEL_NAME,
-                            OPENAI_API_KEY,
-                            hyp,
-                            last_check=st.session_state.get("HELP_LAST_CHECK", ""),
-                        )
+                    assistant_msg = f"""
+{assistant_eval}
 
-                        for line in assistant_msg.splitlines():
-                            if line.startswith("【確認】"):
-                                st.session_state["HELP_LAST_CHECK"] = line.strip()
-                                break
+【次の質問】
+{next_q}
+"""
 
-                        st.session_state["HELP_STAGE"] = 1
-                    else:
-                        assistant_msg = coach_reply(st.session_state[WALL_KEY], hits, wall_mode)
+                    # AI発言保存
+                    st.session_state[WALL_KEY].append({
+                        "role": "assistant",
+                        "content": assistant_msg
+                    })
 
-                    st.session_state[WALL_KEY].append({"role": "assistant", "content": assistant_msg})
                     st.session_state["step2_follow_nonce"] += 1
+
                     st.rerun()
 
             with colq2:
@@ -1209,13 +1382,32 @@ with colL:
                     st.session_state["step2_follow_nonce"] += 1
                     st.rerun()
 
+            # 仮説を取得
+            hypothesis = st.session_state.get(WALL_HYP_KEY, "")
+
             if st.button("🧠 質問を生成（STEP2）", key="step2_gen"):
-                prompt_history = st.session_state[WALL_KEY] + [{
-                    "role": "user",
-                    "content": "上の仮説について、答えは言わずに『質問を3つ』だけ箇条書きで返して。",
-                }]
-                assistant_msg = coach_reply(prompt_history, hits, wall_mode)
-                st.session_state[WALL_KEY].append({"role": "assistant", "content": assistant_msg})
+
+                # ★質問順序が無ければ初期化
+                if "question_step" not in st.session_state:
+                    st.session_state.question_step = 0
+
+                assistant_msg = generate_question(hypothesis)
+
+                sources = format_sources(st.session_state.get(WALL_HITS_KEY, []))
+
+                assistant_msg = f"""
+                【質問】
+                {assistant_msg}
+
+                【参照】
+                {sources}
+                """
+
+                st.session_state[WALL_KEY].append({
+                    "role": "assistant",
+                    "content": assistant_msg
+                })
+
                 st.rerun()
 
             if not st.session_state[WALL_KEY] or st.session_state[WALL_KEY][-1].get("role") != "assistant":
@@ -1261,6 +1453,7 @@ with colL:
         # STEP4
         # =========================
         elif step == 4:
+
             hist = st.session_state[WALL_KEY]
             hits = st.session_state.get(WALL_HITS_KEY, [])
 
@@ -1268,9 +1461,8 @@ with colL:
                 [f"- {format_source_page(d.metadata)}\n{d.page_content[:800]}" for d in hits]
             )
 
-            llm = ChatOpenAI(model=MODEL_NAME, temperature=0.2, api_key=OPENAI_API_KEY)
-
-            prompt = f"""以下を『短く』収束させてください。長文禁止。
+            prompt = f"""
+以下の壁打ちログを短く収束させてください。
 
 # 壁打ちログ
 {hist}
@@ -1279,6 +1471,7 @@ with colL:
 {context}
 
 # 出力フォーマット
+
 【結論（自分の言葉風）】
 -
 
@@ -1296,6 +1489,45 @@ with colL:
 
             st.markdown("### 収束結果")
             st.write(conc)
+
+            st.divider()
+            st.subheader("理解度チェック")
+
+            if st.button("理解度チェックを作る"):
+
+                quiz_prompt = f"""
+                以下の内容を理解できているか確認する
+                理解度チェック問題を1問作ってください。
+
+                # 学習内容
+                {conc}
+
+                # 出力形式
+
+                【理解度チェック】
+
+                問題：
+                （1問）
+
+                A
+                B
+                C
+
+                答え：
+                （1つ）
+
+                解説：
+                （2〜3行）
+                """
+
+                quiz = llm.invoke(quiz_prompt).content
+                st.session_state["last_quiz"] = quiz
+                st.rerun()
+
+            quiz = st.session_state.get("last_quiz")
+
+            if quiz:
+                st.write(quiz)
 
             colb1, colb2 = st.columns(2)
 
@@ -1317,105 +1549,3 @@ with colL:
                     st.session_state[WALL_KEY] = []
                     st.session_state.pop(WALL_HITS_KEY, None)
                     st.rerun()
-
-    # ★ここに「自由チャット（free）」ブロックを貼る
-    if flow_mode == "free":
-        user_msg = st.chat_input("自由チャットで入力…")
-
-        if user_msg:
-            user_text = user_msg.strip()
-            if user_text:
-                st.session_state[WALL_KEY].append({"role": "user", "content": user_text})
-
-                # ★同じ入力なら、前回のhitsをそのまま使う（検索しない）
-                if st.session_state.get("FREE_LAST_QUERY") == user_text:
-                    cached = st.session_state.get(WALL_HITS_KEY, [])
-                else:
-                    st.session_state["FREE_LAST_QUERY"] = user_text
-
-                    # ★free用：検索キャッシュ（クエリ＋設定で一意）
-                    cache_key = make_retrieve_key(
-                        user_text,
-                        top_k=int(wall_k),
-                        filter_opt={"only_textbook": bool(wall_only_textbook)},
-                    )
-
-                    cached = cache_get("RETRIEVE_CACHE", cache_key)
-                    if cached is None:
-                        cached = retrieve_hits(
-                            user_text,
-                            k=int(wall_k),
-                            only_textbook=wall_only_textbook,
-                        )
-                        cache_set("RETRIEVE_CACHE", cache_key, cached)
-
-                st.session_state[WALL_HITS_KEY] = cached
-
-                assistant_msg = coach_reply(
-                    st.session_state[WALL_KEY],
-                    cached,
-                    wall_mode
-                )
-
-                st.session_state[WALL_KEY].append({"role": "assistant", "content": assistant_msg})
-                st.rerun()
-
-# --- まとめ・カード化 ---
-st.divider()
-colA, colB = st.columns(2)
-
-with colA:
-    if st.button("🧾 この壁打ちをまとめる"):
-        hist = st.session_state[WALL_KEY]
-        hits = st.session_state.get(WALL_HITS_KEY, [])
-        context = "\n\n".join([f"- {format_source_page(d.metadata)}\n{d.page_content[:800]}" for d in hits])
-
-        llm = ChatOpenAI(model=MODEL_NAME, temperature=0.2, api_key=OPENAI_API_KEY)
-        prompt = f"""以下の壁打ちログを、復習に使える形でまとめてください。
-解説しすぎず、再現できる形にする。
-
-# 壁打ちログ
-{hist}
-
-# 根拠
-{context}
-
-# 出力フォーマット
-【結論（自分の言葉風に要約）】
--
-
-【根拠（参照点）】
--
-
-【次の一手（最短3つ）】
-1.
-2.
-3.
-"""
-        st.session_state[WALL_SUMMARY_KEY] = llm.invoke(prompt).content
-        st.rerun()
-
-with colB:
-    if st.button("🗑 壁打ちをリセット"):
-        st.session_state[WALL_KEY] = []
-        st.session_state.pop(WALL_SUMMARY_KEY, None)
-        st.session_state.pop(WALL_HITS_KEY, None)
-        st.rerun()
-
-summary = st.session_state.get(WALL_SUMMARY_KEY)
-if summary:
-    st.subheader("まとめ")
-    st.write(summary)
-    if st.button("📝 この壁打ちまとめをカード化"):
-        cards = load_review_cards()
-        card = make_review_card(
-            topic="壁打ちまとめ",
-            answer=summary,
-            hits=st.session_state.get(WALL_HITS_KEY, []),
-        )
-        cards.append(card)
-        save_review_cards(cards)
-        st.success(f"カード化しました！ id={card['id']}")
-        st.rerun()
-
-st.caption(f"壁打ち履歴: {len(st.session_state[WALL_KEY])} メッセージ")
