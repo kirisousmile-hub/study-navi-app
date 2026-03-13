@@ -1,0 +1,14 @@
+{
+  "A1: for文は繰り返し処理を行うため": {
+    "correct": 1,
+    "total": 1
+  },
+  "A2: for 任意の変数名 in 繰り": {
+    "correct": 1,
+    "total": 1
+  },
+  "A3: for文は繰り返し処理の数が決ま": {
+    "correct": 1,
+    "total": 1
+  }
+}

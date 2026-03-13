@@ -1,0 +1,9 @@
+{
+  "variables": [],
+  "lists": ["variables"],
+  "loops": ["variables", "lists"],
+  "functions": ["variables", "loops"],
+  "modules": ["functions"],
+  "exceptions": ["functions"],
+  "classes": ["functions"]
+}

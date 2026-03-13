@@ -24,3 +24,5 @@ review_cards.json
 wall_memory.json
 run_id.txt
 *.log
+
+env_unused/
