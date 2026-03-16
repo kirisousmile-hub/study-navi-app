@@ -34,8 +34,6 @@ st.set_page_config(
     layout="wide"
 )
 from sklearn.metrics.pairwise import cosine_similarity
-from docx import Document as DocxDocument
-
 
 ############################################
 # 3) LangChain / LLM
@@ -43,13 +41,6 @@ from docx import Document as DocxDocument
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
 from langchain_community.vectorstores import Chroma
-from langchain_community.document_loaders import (
-    PyPDFLoader,
-    TextLoader,
-    CSVLoader,
-)
-
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from langchain_core.messages import (
     SystemMessage,
@@ -111,7 +102,6 @@ from core.coach import (
     add_wall_summary,
     build_memory_block,
     summarize_wall_history,
-    retrieve_hits,
     coach_reply,
     delete_wall_fact,
     delete_wall_summary,
@@ -133,8 +123,19 @@ from core.vector_db import (
 )
 
 # rag
-from core.rag import prepare_documents
+from core.rag import (
+    prepare_documents,
+    retrieve_hits,
+    answer_with_rag,
+)
 
+#materials
+from core.materials import (
+    save_uploaded_files,
+    collect_local_files,
+    load_one_file,
+    split_docs,
+)
 ############################################
 # ENV / MODEL CONFIG
 ############################################
@@ -219,41 +220,6 @@ def clear_tmp_uploads():
         shutil.rmtree(TMP_UPLOAD_DIR, ignore_errors=True)
     Path(TMP_UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
 
-
-def rerank_docs(question: str, docs: List[Document], embeddings, top_k: int = 4) -> List[Document]:
-    if not docs:
-        return []
-
-    q_emb = embeddings.embed_query(question)
-    texts = [d.page_content[:800] for d in docs]
-    doc_embs = embeddings.embed_documents(texts)
-
-    scores = cosine_similarity([q_emb], doc_embs)[0]
-    scored = list(zip(scores, docs))
-    scored.sort(key=lambda x: x[0], reverse=True)
-
-    return [d for _, d in scored[:top_k]]
-
-
-def retrieve_hits(
-    query: str,
-    db,
-    embeddings,
-    k: int = 5,
-    only_textbook: bool = True
-) -> List[Document]:
-    search_kwargs = {"k": int(k) * 3}
-
-    if only_textbook:
-        search_kwargs["filter"] = {"category": "textbook"}
-
-    retriever = db.as_retriever(search_kwargs=search_kwargs)
-    raw_hits = retriever.invoke(query)
-
-    reranked = rerank_docs(query, raw_hits, embeddings, top_k=int(k))
-
-    return unique_by_source_page(reranked, int(k))
-
 def format_sources(docs: List[Document]) -> str:
     """# なぜ：sources表示の重複を除いて読みやすくする"""
     seen = set()
@@ -266,91 +232,6 @@ def format_sources(docs: List[Document]) -> str:
         lines.append(f"- {label}")
     return "\n".join(lines) if lines else "- (なし)"
 
-def save_uploaded_files(uploaded_files) -> List[Path]:
-    """# なぜ：StreamlitのUploadedFileはそのままLoaderに渡せないので一旦保存する"""
-    ensure_dirs()
-    clear_tmp_uploads()
-    saved_paths: List[Path] = []
-    for uf in uploaded_files:
-        p = Path(TMP_UPLOAD_DIR) / uf.name
-        with open(p, "wb") as f:
-            f.write(uf.getbuffer())
-        saved_paths.append(p)
-    return saved_paths
-
-def collect_local_files() -> List[Path]:
-    """# なぜ：教材/メモをフォルダに置くだけで自動投入できるようにする"""
-    paths: List[Path] = []
-    if LECTURES_PDF_DIR.exists():
-        paths.extend(sorted(LECTURES_PDF_DIR.glob("*.pdf")))
-    if NOTES_DIR.exists():
-        paths.extend(sorted(NOTES_DIR.glob("*.txt")))
-        paths.extend(sorted(NOTES_DIR.glob("*.md")))
-    return paths
-
-############################################
-# 3) LOAD / SPLIT / IDS
-############################################
-def load_docx(path: Path) -> List[Document]:
-    """# なぜ：LangChainのdocx loaderは環境差で落ちることがあるため自前で読む"""
-    doc = DocxDocument(str(path))
-    text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
-    return [Document(page_content=text, metadata={"source": path.name, "path": str(path), "page": 1})]
-
-def load_one_file(path: Path) -> List[Document]:
-    """# なぜ：各形式の読み込み＋metadata付与を1箇所に集約して事故を減らす"""
-    ext = path.suffix.lower()
-
-    lesson = infer_lesson_from_path(path)
-    is_lecture_pdf = (LECTURES_PDF_DIR in path.parents) and (ext == ".pdf")
-
-    base_meta = {
-        "path": str(path),
-        "lesson": lesson,
-        "category": "textbook" if is_lecture_pdf else "notes",
-    }
-
-    if ext == ".pdf":
-        loader = PyPDFLoader(str(path))
-        docs = loader.load()
-        for d in docs:
-            d.metadata["source"] = f"lectures/{path.name}"
-            d.metadata.update(base_meta)
-        return docs
-
-    if ext == ".txt":
-        for enc in ("utf-8", "utf-8-sig", "cp932"):
-            try:
-                loader = TextLoader(str(path), encoding=enc)
-                docs = loader.load()
-                for d in docs:
-                    d.metadata["source"] = f"notes/{path.name}"
-                    d.metadata.update(base_meta)
-                return docs
-            except Exception:
-                continue
-        raise ValueError(f"TXTの読み込みに失敗しました: {path.name}")
-
-    # ※必要ならここに .csv .docx を追加
-    raise ValueError(f"未対応形式: {ext}")
-
-def split_docs(docs: List[Document]) -> List[Document]:
-    """# なぜ：PDFをそのまま入れると長すぎて検索精度が落ちるのでchunk化する"""
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=900,
-        chunk_overlap=150,
-        separators=["\n\n", "\n", "。", " ", ""],
-    )
-    chunks = splitter.split_documents(docs)
-    for c in chunks:
-        c.metadata["source"] = c.metadata.get("source", "unknown")
-        if "page" not in c.metadata:
-            c.metadata["page"] = None
-    return chunks
-
-
-
-
 ############################################
 # 4) DB / REGISTRY
 ############################################
@@ -362,84 +243,6 @@ def get_run_id() -> str:
     rid = hashlib.md5(os.urandom(16)).hexdigest()[:8]
     st.session_state[RUN_ID_KEY] = rid
     return rid
-
-
-
-
-
-
-
-
-############################################
-# 5) RAG (answer_with_rag)
-############################################
-def answer_with_rag(
-    question: str,
-    k: int = 4,
-    only_textbook: bool = False,
-    lesson_filter: str | None = None
-) -> Tuple[str, List[Document]]:
-    """# なぜ：『質問→根拠→次の一手』を最小構成で安定させる"""
-    db = get_db(EMBEDDINGS)
-
-    search_kwargs = {"k": int(k) * 3}
-
-    where = None
-
-    if only_textbook and lesson_filter:
-        where = {
-            "$and": [
-                {"category": "textbook"},
-                {"lesson": lesson_filter}
-            ]
-        }
-
-    elif only_textbook:
-        where = {"category": "textbook"}
-
-    elif lesson_filter:
-        where = {"lesson": lesson_filter}
-
-    if where:
-        search_kwargs["filter"] = where
-
-    retriever = db.as_retriever(search_kwargs=search_kwargs)
-    raw_hits = retriever.invoke(question)
-
-    # rerank追加
-    reranked = rerank_docs(question, raw_hits, top_k=int(k))
-
-    hits = unique_by_source_page(reranked, int(k))
-
-    context = "\n\n".join(
-        [f"[{i}] {format_source_page(d.metadata)}\n{d.page_content}" for i, d in enumerate(hits, start=1)]
-    )
-
-
-    prompt = f"""あなたは「学習ナビ」です。
-以下の「参照コンテキスト」だけに基づいて回答してください。
-推測で断定しない。分からなければ「不明」と言い、確認手順を提案する。
-
-# ユーザーの質問
-{question}
-
-# 参照コンテキスト
-{context}
-
-# 出力フォーマット（必ず守る）
-【結論】
-- （1〜3行）
-
-【根拠（参照した資料の要点）】
-- （必ず番号[1]などを交えて）
-- （可能なら必ず「PDF名 p.X」を含める）
-
-【次の一手（最短3つ）】
-1.
-2.
-3.
-"""
-    return LLM.invoke(prompt).content, hits
 
 ############################################
 # LEARNING PROFILE
@@ -694,11 +497,14 @@ with tab_learn:
         try:
             with st.spinner("検索＆回答中..."):
                 ans, hits = answer_with_rag(
-                question,
-                k=int(k),
-                only_textbook=only_textbook,
-                lesson_filter=lesson_filter
-            )
+                    question=question,
+                    db=db,
+                    embeddings=EMBEDDINGS,
+                    llm=LLM,
+                    k=int(k),
+                    only_textbook=only_textbook,
+                    lesson_filter=lesson_filter or None,
+                )
 
             st.session_state["last_question"] = question
             st.session_state["last_answer"] = ans
@@ -1476,7 +1282,7 @@ with tab_material:
             else:
                 before = get_db(EMBEDDINGS)._collection.count()
 
-                build_or_update_vectorstore(chunks)
+                build_or_update_vectorstore(chunks, EMBEDDINGS)
 
                 after = get_db(EMBEDDINGS)._collection.count()
                 st.info(f"Chroma count: {before} -> {after} (+{after - before})")

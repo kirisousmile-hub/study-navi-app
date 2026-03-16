@@ -2,9 +2,8 @@
 .env
 *.env
 
-# data
+# data (教材・個人学習データは上げない)
 data/
-lectures_pdf/
 
 # vectorstore
 vectorstore_main/
@@ -20,9 +19,14 @@ venv/
 tmp_uploads/
 
 # generated files
-review_cards.json
 wall_memory.json
 run_id.txt
 *.log
 
+# local-only
 env_unused/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/

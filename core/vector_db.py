@@ -1,20 +1,13 @@
-import os
 import json
 import hashlib
-import uuid
 from pathlib import Path
 from typing import List
 
-from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
 
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-
 PERSIST_DIR = "vectorstore_main"
 REGISTRY_DIR = "vectorstore_registry"
-
 
 def file_fingerprint(path: Path) -> str:
 
@@ -115,7 +108,6 @@ def build_or_update_vectorstore(
     all_docs: List[Document],
     embeddings
 ) -> Chroma:
-
     db = Chroma(
         persist_directory=get_main_dir(),
         embedding_function=embeddings
@@ -124,66 +116,49 @@ def build_or_update_vectorstore(
     if not all_docs:
         return db
 
-    ids = [generate_chunk_id(doc) for doc in all_docs]
+    clean_docs = []
+    ids = []
 
-    if not ids:
-        return db
-
-    existing_ids = set()
-
-    try:
-        got = db._collection.get(ids=ids, include=[])
-        existing_ids = set(got.get("ids", []) or [])
-
-    except Exception:
-        existing_ids = set()
-
-    new_docs = []
-    new_ids = []
-
-    for doc, _id in zip(all_docs, ids):
-
-        if _id in existing_ids:
-            continue
-
-        new_docs.append(doc)
-        new_ids.append(_id)
-
-    if not new_docs:
-        return db
-
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=800,
-        chunk_overlap=100
-    )
-
-    split_docs = text_splitter.split_documents(new_docs)
-
-    for doc in split_docs:
-
+    for doc in all_docs:
         clean_meta = {}
 
         for k, v in doc.metadata.items():
-
             if v is None:
                 continue
-
             if isinstance(v, (str, int, float, bool)):
                 clean_meta[k] = v
             else:
                 clean_meta[k] = str(v)
 
         doc.metadata = clean_meta
+        clean_docs.append(doc)
+        ids.append(generate_chunk_id(doc))
 
-    ids = [str(uuid.uuid4()) for _ in split_docs]
+    existing_ids = set()
+
+    try:
+        got = db._collection.get(ids=ids, include=[])
+        existing_ids = set(got.get("ids", []) or [])
+    except Exception:
+        existing_ids = set()
+
+    new_docs = []
+    new_ids = []
+
+    for doc, _id in zip(clean_docs, ids):
+        if _id in existing_ids:
+            continue
+        new_docs.append(doc)
+        new_ids.append(_id)
+
+    if not new_docs:
+        return db
 
     BATCH_SIZE = 100
 
-    for i in range(0, len(split_docs), BATCH_SIZE):
-
-        batch_docs = split_docs[i:i+BATCH_SIZE]
-        batch_ids = ids[i:i+BATCH_SIZE]
-
+    for i in range(0, len(new_docs), BATCH_SIZE):
+        batch_docs = new_docs[i:i + BATCH_SIZE]
+        batch_ids = new_ids[i:i + BATCH_SIZE]
         db.add_documents(batch_docs, ids=batch_ids)
 
     try:

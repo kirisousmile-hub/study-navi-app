@@ -6,12 +6,7 @@ from pathlib import Path
 
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.documents import Document
-from sklearn.metrics.pairwise import cosine_similarity
-
-
-
-from core.utils import format_source_page, unique_by_source_page
-
+from core.utils import format_source_page
 
 # 永続メモ
 WALL_MEMORY_FILE = "wall_memory.json"
