@@ -1,132 +1,136 @@
 import json
 import uuid
 from datetime import datetime
-from typing import List
 from pathlib import Path
+from typing import List
 
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.documents import Document
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
 from core.utils import format_source_page
 
-# 永続メモ
-WALL_MEMORY_FILE = "wall_memory.json"
 
+WALL_MEMORY_FILE = "wall_memory.json"
 TURN_LIMIT = 30
 
 
+def empty_wall_memory() -> dict:
+    return {"facts": [], "summaries": []}
+
+
+def normalize_wall_memory(data: dict) -> dict:
+    data.setdefault("facts", [])
+    data.setdefault("summaries", [])
+    return data
+
+
 def load_wall_memory() -> dict:
-    if not Path(WALL_MEMORY_FILE).exists():
-        return {"facts": [], "summaries": []}
+    path = Path(WALL_MEMORY_FILE)
+
+    if not path.exists():
+        return empty_wall_memory()
 
     try:
-        data = json.loads(Path(WALL_MEMORY_FILE).read_text(encoding="utf-8"))
-        data.setdefault("facts", [])
-        data.setdefault("summaries", [])
-        return data
-    except:
-        return {"facts": [], "summaries": []}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return empty_wall_memory()
+        return normalize_wall_memory(data)
+    except json.JSONDecodeError:
+        return empty_wall_memory()
+    except OSError:
+        return empty_wall_memory()
 
 
-def save_wall_memory(mem: dict):
+def save_wall_memory(mem: dict) -> None:
     Path(WALL_MEMORY_FILE).write_text(
-        json.dumps(mem, ensure_ascii=False, indent=2),
-        encoding="utf-8"
+        json.dumps(normalize_wall_memory(mem), ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
 
 
-def add_wall_fact(text: str) -> dict:
-    mem = load_wall_memory()
+def append_wall_memory_item(key: str, item: dict) -> dict:
+    data = load_wall_memory()
+    data.setdefault(key, [])
+    data[key].append(item)
+    save_wall_memory(data)
+    return item
 
+
+def add_wall_fact(text: str) -> dict:
     fact = {
         "id": str(uuid.uuid4())[:8],
         "text": text.strip(),
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
-
-    mem.setdefault("facts", [])
-    mem["facts"].append(fact)
-
-    save_wall_memory(mem)
-
-    return fact
+    return append_wall_memory_item("facts", fact)
 
 
 def add_wall_summary(summary_text: str) -> dict:
-    data = load_wall_memory()
-
-    if "facts" not in data:
-        data["facts"] = []
-    if "summaries" not in data:
-        data["summaries"] = []
-
     item = {
         "id": datetime.now().strftime("%Y%m%d%H%M%S"),
         "text": summary_text.strip(),
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
-
-    data["summaries"].append(item)
-    save_wall_memory(data)
-    return item
+    return append_wall_memory_item("summaries", item)
 
 
 def build_memory_block(
     limit: int = 10,
     include_facts: bool = True,
-    include_summaries: bool = True
+    include_summaries: bool = True,
 ) -> str:
     data = load_wall_memory()
-
     lines = []
 
     if include_facts:
         facts = data.get("facts", [])[-limit:]
         if facts:
             lines.append("【長期記憶: 固定メモ】")
-            for f in facts:
-                lines.append(f"- {f['text']}")
+            for fact in facts:
+                lines.append(f"- {fact['text']}")
 
     if include_summaries:
         summaries = data.get("summaries", [])[-limit:]
         if summaries:
             lines.append("【長期記憶: 学習要約】")
-            for s in summaries:
-                lines.append(f"- {s['text']}")
+            for summary in summaries:
+                lines.append(f"- {summary['text']}")
 
     return "\n".join(lines).strip()
 
-def rerank_docs(question: str, docs: List[Document], embeddings, top_k: int = 4) -> List[Document]:
-    if not docs:
-        return []
 
-    q_emb = embeddings.embed_query(question)
-    texts = [d.page_content[:800] for d in docs]
-    doc_embs = embeddings.embed_documents(texts)
+def get_role_rule(mode: str) -> str:
+    if mode.startswith("A"):
+        return (
+            "あなたは『用語理解コーチ』です。\n"
+            "目的は、用語の意味・役割・具体例を、ユーザーが理解できる形に整理して伝えることです。\n"
+            "必要なら短く説明してから確認してください。\n"
+            "1回の返答では、意味・役割・具体例のどれか1つだけを進めてください。"
+        )
 
-    scores = cosine_similarity([q_emb], doc_embs)[0]
-    scored = list(zip(scores, docs))
-    scored.sort(key=lambda x: x[0], reverse=True)
+    if mode.startswith("B"):
+        return (
+            "あなたは『設計理解コーチ』です。\n"
+            "目的は、分ける理由・役割の違い・設計判断を、ユーザーが納得できる形に整理することです。\n"
+            "必要なら短く説明してから確認してください。\n"
+            "1回の返答では、分ける理由・分けないと困ること・境界のどれか1つだけを進めてください。"
+        )
 
-    return [d for _, d in scored[:top_k]]
+    return (
+        "あなたは『コード理解コーチ』です。\n"
+        "目的は、コードを1行ずつ読み、実行順・変数の変化・出力を、ユーザーが理解できる形に整理することです。\n"
+        "必要なら短く説明してから確認してください。\n"
+        "1回の返答では、実行順・変数・出力予想のどれか1つだけを進めてください。\n"
+        "特にコード理解では、確認したい値や出力を先に完全に言い切らず、直前のヒントまでにとどめてください。\n"
+        "ユーザーが『最初の値』『次の値』『出力』を考えられる段階なら、正解を先に書かずに質問してください。"
+    )
 
-def retrieve_hits(
-    query: str,
-    db,
-    embeddings,
-    k: int = 5,
-    only_textbook: bool = True
-) -> List[Document]:
-    search_kwargs = {"k": int(k) * 3}
 
-    if only_textbook:
-        search_kwargs["filter"] = {"category": "textbook"}
-
-    retriever = db.as_retriever(search_kwargs=search_kwargs)
-    raw_hits = retriever.invoke(query)
-
-    reranked = rerank_docs(query, raw_hits, embeddings, top_k=int(k))
-
-    return unique_by_source_page(reranked, int(k))
+def build_context_block(hits: List[Document], limit: int = 3, max_chars: int = 500) -> str:
+    context = "\n\n".join(
+        [f"{format_source_page(d.metadata)}\n{d.page_content[:max_chars]}" for d in hits[:limit]]
+    )
+    return context or "(教材根拠なし)"
 
 
 def coach_reply(
@@ -134,38 +138,11 @@ def coach_reply(
     hits: List[Document],
     mode: str,
     llm,
-    use_long_memory: bool = False
+    use_long_memory: bool = False,
 ) -> str:
     recent = history[-(TURN_LIMIT * 2):]
+    context = build_context_block(hits)
 
-    context = "\n\n".join(
-        [f"{format_source_page(d.metadata)}\n{d.page_content[:500]}" for d in hits[:3]]
-    ) or "(教材根拠なし)"
-
-    if mode.startswith("A"):
-        role_rule = (
-            "あなたは『用語理解コーチ』です。\n"
-            "目的は、用語の意味・役割・具体例を、ユーザーが理解できる形に整理して伝えることです。\n"
-            "必要なら短く説明してから確認してください。\n"
-            "1回の返答では、意味・役割・具体例のどれか1つだけを進めてください。"
-        )
-    elif mode.startswith("B"):
-        role_rule = (
-            "あなたは『設計理解コーチ』です。\n"
-            "目的は、分ける理由・役割の違い・設計判断を、ユーザーが納得できる形に整理することです。\n"
-            "必要なら短く説明してから確認してください。\n"
-            "1回の返答では、分ける理由・分けないと困ること・境界のどれか1つだけを進めてください。"
-        )
-        # C: コード理解
-    else:
-        role_rule = (
-            "あなたは『コード理解コーチ』です。\n"
-            "目的は、コードを1行ずつ読み、実行順・変数の変化・出力を、ユーザーが理解できる形に整理することです。\n"
-            "必要なら短く説明してから確認してください。\n"
-            "1回の返答では、実行順・変数・出力予想のどれか1つだけを進めてください。\n"
-            "特にコード理解では、確認したい値や出力を先に完全に言い切らず、直前のヒントまでにとどめてください。\n"
-            "ユーザーが『最初の値』『次の値』『出力』を考えられる段階なら、正解を先に書かずに質問してください。"
-        )
     coaching_rule = (
         "次のルールを必ず守ってください。\n"
         "- 返答は合理的で簡潔にする\n"
@@ -200,7 +177,7 @@ def coach_reply(
     )
 
     messages = [
-        SystemMessage(content=role_rule),
+        SystemMessage(content=get_role_rule(mode)),
         SystemMessage(content=coaching_rule),
         SystemMessage(content=style_hint),
     ]
@@ -220,11 +197,11 @@ def coach_reply(
         )
     )
 
-    for m in recent:
-        if m["role"] == "user":
-            messages.append(HumanMessage(content=m["content"]))
-        elif m["role"] == "assistant":
-            messages.append(AIMessage(content=m["content"]))
+    for message in recent:
+        if message["role"] == "user":
+            messages.append(HumanMessage(content=message["content"]))
+        elif message["role"] == "assistant":
+            messages.append(AIMessage(content=message["content"]))
 
     return llm.invoke(messages).content
 
@@ -245,23 +222,24 @@ def summarize_wall_history(history: list, hits: List[Document], llm) -> str:
 
 # 出力フォーマット
 【今回わかったこと】
-- 
+-
 
 【まだ曖昧なこと】
-- 
+-
 
 【次に続ける論点】
-- 
+-
 
 【覚えておくルール】
-- 
+-
 """
     return llm.invoke(prompt).content
+
 
 def delete_wall_fact(fact_id: str) -> bool:
     data = load_wall_memory()
     facts = data.get("facts", [])
-    new_facts = [f for f in facts if f.get("id") != fact_id]
+    new_facts = [fact for fact in facts if fact.get("id") != fact_id]
 
     if len(new_facts) == len(facts):
         return False
@@ -274,7 +252,7 @@ def delete_wall_fact(fact_id: str) -> bool:
 def delete_wall_summary(summary_id: str) -> bool:
     data = load_wall_memory()
     summaries = data.get("summaries", [])
-    new_summaries = [s for s in summaries if s.get("id") != summary_id]
+    new_summaries = [summary for summary in summaries if summary.get("id") != summary_id]
 
     if len(new_summaries) == len(summaries):
         return False

@@ -1,4 +1,4 @@
-from typing import List, Tuple, Optional
+from typing import List, Optional, Tuple
 
 from sklearn.metrics.pairwise import cosine_similarity
 from langchain_core.documents import Document
@@ -6,40 +6,70 @@ from langchain_core.documents import Document
 from core.utils import format_source_page, unique_by_source_page
 
 
-def prepare_documents(docs: List[Document]) -> List[Document]:
-    cleaned = []
+def normalize_doc_metadata(docs: List[Document]) -> List[Document]:
+    normalized_docs: List[Document] = []
 
-    for d in docs:
+    for doc in docs:
         meta = {}
 
-        for k, v in d.metadata.items():
-            if v is None:
+        for key, value in doc.metadata.items():
+            if value is None:
                 continue
 
-            if isinstance(v, (str, int, float, bool)):
-                meta[k] = v
+            if isinstance(value, (str, int, float, bool)):
+                meta[key] = value
             else:
-                meta[k] = str(v)
+                meta[key] = str(value)
 
-        d.metadata = meta
-        cleaned.append(d)
+        normalized_docs.append(
+            Document(
+                page_content=doc.page_content,
+                metadata=meta,
+            )
+        )
 
-    return cleaned
+    return normalized_docs
 
 
-def rerank_docs(question: str, docs: List[Document], embeddings, top_k: int = 4) -> List[Document]:
+def build_search_filter(
+    only_textbook: bool,
+    lesson_filter: Optional[str],
+) -> Optional[dict]:
+    if only_textbook and lesson_filter:
+        return {
+            "$and": [
+                {"category": "textbook"},
+                {"lesson": lesson_filter},
+            ]
+        }
+
+    if only_textbook:
+        return {"category": "textbook"}
+
+    if lesson_filter:
+        return {"lesson": lesson_filter}
+
+    return None
+
+
+def rerank_docs(
+    question: str,
+    docs: List[Document],
+    embeddings,
+    top_k: int = 4,
+) -> List[Document]:
     if not docs:
         return []
 
-    q_emb = embeddings.embed_query(question)
-    texts = [d.page_content[:800] for d in docs]
-    doc_embs = embeddings.embed_documents(texts)
+    query_embedding = embeddings.embed_query(question)
+    texts = [doc.page_content[:800] for doc in docs]
+    doc_embeddings = embeddings.embed_documents(texts)
 
-    scores = cosine_similarity([q_emb], doc_embs)[0]
-    scored = list(zip(scores, docs))
-    scored.sort(key=lambda x: x[0], reverse=True)
+    scores = cosine_similarity([query_embedding], doc_embeddings)[0]
+    scored_docs = list(zip(scores, docs))
+    scored_docs.sort(key=lambda x: x[0], reverse=True)
 
-    return [d for _, d in scored[:top_k]]
+    return [doc for _, doc in scored_docs[:top_k]]
 
 
 def retrieve_hits(
@@ -52,28 +82,20 @@ def retrieve_hits(
 ) -> List[Document]:
     search_kwargs = {"k": int(k) * 3}
 
-    where = None
-
-    if only_textbook and lesson_filter:
-        where = {
-            "$and": [
-                {"category": "textbook"},
-                {"lesson": lesson_filter}
-            ]
-        }
-    elif only_textbook:
-        where = {"category": "textbook"}
-    elif lesson_filter:
-        where = {"lesson": lesson_filter}
-
-    if where:
-        search_kwargs["filter"] = where
+    search_filter = build_search_filter(
+        only_textbook=only_textbook,
+        lesson_filter=lesson_filter,
+    )
+    if search_filter:
+        search_kwargs["filter"] = search_filter
 
     retriever = db.as_retriever(search_kwargs=search_kwargs)
     raw_hits = retriever.invoke(query)
 
     reranked = rerank_docs(query, raw_hits, embeddings, top_k=int(k))
-    return unique_by_source_page(reranked, int(k))
+    unique_hits = unique_by_source_page(reranked, int(k))
+
+    return normalize_doc_metadata(unique_hits)
 
 
 def answer_with_rag(
@@ -83,7 +105,7 @@ def answer_with_rag(
     llm,
     k: int = 4,
     only_textbook: bool = False,
-    lesson_filter: Optional[str] = None
+    lesson_filter: Optional[str] = None,
 ) -> Tuple[str, List[Document]]:
     hits = retrieve_hits(
         query=question,
@@ -94,8 +116,23 @@ def answer_with_rag(
         lesson_filter=lesson_filter,
     )
 
+    if not hits:
+        return (
+            "【結論】\n"
+            "- 該当する教材が見つかりませんでした。\n\n"
+            "【根拠（参照した資料の要点）】\n"
+            "- 参照候補が0件でした。\n\n"
+            "【次の一手（最短3つ）】\n"
+            "1. 質問文を短くして再検索する\n"
+            "2. Lessonフィルターを外して再検索する\n"
+            "3. 教材管理タブでインデックス作成状況を確認する"
+        ), []
+
     context = "\n\n".join(
-        [f"[{i}] {format_source_page(d.metadata)}\n{d.page_content}" for i, d in enumerate(hits, start=1)]
+        [
+            f"[{i}] {format_source_page(doc.metadata)}\n{doc.page_content}"
+            for i, doc in enumerate(hits, start=1)
+        ]
     )
 
     prompt = f"""あなたは「学習ナビ」です。

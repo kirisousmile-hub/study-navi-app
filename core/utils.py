@@ -52,3 +52,17 @@ def count_turns(history: list) -> tuple[int, int]:
     msg_count = len(history)
     turn_count = msg_count // 2
     return turn_count, msg_count
+
+def format_sources(docs: List[Document]) -> str:
+    """sources表示の重複を除いて読みやすくする"""
+    seen = set()
+    lines = []
+
+    for d in docs:
+        label = format_source_page(d.metadata)
+        if label in seen:
+            continue
+        seen.add(label)
+        lines.append(f"- {label}")
+
+    return "\n".join(lines) if lines else "- (なし)"
