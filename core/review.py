@@ -11,6 +11,10 @@ from core.utils import format_source_page
 
 REVIEW_FILE = Path("data/user/review_cards.json")
 REVIEW_INTERVAL_DAYS = {
+    "表面的理解": 1,
+    "部分理解": 2,
+    "概念理解": 7,
+    "応用理解": 14,
     0: 1,
     1: 2,
     2: 7,
@@ -38,12 +42,11 @@ def save_review_cards(cards: list) -> None:
     )
 
 
-def compute_next_review_date(score: int) -> str:
+def compute_next_review_date(score_or_level) -> str:
     today = datetime.now().date()
-    days = REVIEW_INTERVAL_DAYS.get(score, 1)
+    days = REVIEW_INTERVAL_DAYS.get(score_or_level, 1)
     next_day = today + timedelta(days=days)
     return next_day.strftime("%Y-%m-%d")
-
 
 def is_due(card: dict, today: str | None = None) -> bool:
     """カードが今日の復習対象かどうかを返す"""
@@ -57,7 +60,7 @@ def is_due(card: dict, today: str | None = None) -> bool:
 def update_review_card_score(
     cards: list[dict],
     card_id: str,
-    new_score: int,
+    new_score,
 ) -> dict | None:
     """指定カードの復習スコアを更新して保存し、更新後カードを返す"""
     updated_card = None
@@ -65,6 +68,8 @@ def update_review_card_score(
     for i, card in enumerate(cards):
         if card.get("id") == card_id:
             card["score"] = new_score
+            if isinstance(new_score, str):
+                card["level"] = new_score
             card["last_review_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             card["next_review_date"] = compute_next_review_date(new_score)
             cards[i] = card
@@ -93,6 +98,7 @@ def make_review_card(
         "answer": answer,
         "sources": sources,
         "score": None,
+        "level": None,
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "last_review_at": None,
         "next_review_date": datetime.now().strftime("%Y-%m-%d"),

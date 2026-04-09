@@ -172,7 +172,7 @@ def generate_self_test(topic: str, hits: List[Document], llm_creative) -> dict:
     )
 
     prompt = f"""
-以下の教材内容から理解度を確認する問題を作ってください。
+以下の教材内容から理解度を確認する問題を3問作ってください。
 
 # トピック
 {topic}
@@ -180,18 +180,52 @@ def generate_self_test(topic: str, hits: List[Document], llm_creative) -> dict:
 # 教材
 {context}
 
-# 出力形式
-必ずJSONのみを返してください。
-説明文、前置き、```json などのコードフェンスは不要です。
+# 条件
+・初心者向け
+・出力は必ずJSONのみ
+・説明文、前置き、コードフェンスは不要
 
+# 出力形式
 {{
-  "questions": ["質問1", "質問2", "質問3"],
-  "answers": ["答え1", "答え2", "答え3"]
+  "items": [
+    {{
+      "question": "問題文1",
+      "reference": "模範回答1",
+      "explanation": "解説1"
+    }},
+    {{
+      "question": "問題文2",
+      "reference": "模範回答2",
+      "explanation": "解説2"
+    }},
+    {{
+      "question": "問題文3",
+      "reference": "模範回答3",
+      "explanation": "解説3"
+    }}
+  ]
 }}
 """
 
     result = llm_creative.invoke(prompt).content
-    return parse_llm_json(result, "自己テストJSONの解析に失敗しました")
+    data = parse_llm_json(result, "自己テストJSONの解析に失敗しました")
+
+    items = data.get("items", [])
+    normalized_items = []
+
+    for item in items:
+        normalized_items.append({
+            "topic": topic,
+            "question": item.get("question", ""),
+            "reference": item.get("reference", ""),
+            "explanation": item.get("explanation", ""),
+            "source": "self_test",
+        })
+
+    return {
+        "source": "self_test",
+        "items": normalized_items
+    }
 
 
 def grade_answer(
@@ -205,6 +239,35 @@ def grade_answer(
     register_weak_point
 ):
     prompt = f"""
+あなたは学習コーチです。
+生徒の回答を、次の4段階のいずれか1つで評価してください。
+
+【評価段階】
+- 表面的理解
+- 部分理解
+- 概念理解
+- 応用理解
+
+【判定基準】
+- 表面的理解:
+  用語を少し知っている程度。説明がかなり曖昧、または誤りが多い。
+- 部分理解:
+  一部は合っているが、重要な要点が抜けている。
+- 概念理解:
+  中心となる意味や仕組みを正しく説明できている。
+- 応用理解:
+  概念理解に加えて、具体例・使い分け・注意点まで説明できている。
+
+【出力条件】
+- 出力は必ずJSONのみ
+- 説明文、前置き、コードフェンスは不要
+- 次の形式を厳守してください
+
+{{
+  "level": "表面的理解 または 部分理解 または 概念理解 または 応用理解",
+  "comment": "生徒向けの短い解説"
+}}
+
 問題
 {question}
 
@@ -213,27 +276,38 @@ def grade_answer(
 
 生徒の回答
 {user_answer}
-
-【評価】
-正解 / 部分正解 / 不正解
-
-【解説】
 """
 
     result = llm.invoke(prompt).content
-    correct = ("正解" in result) and ("不正解" not in result)
+    data = parse_llm_json(result, "採点結果JSONの解析に失敗しました")
+
+    level = data.get("level", "表面的理解")
+    comment = data.get("comment", "").strip()
+
+    allowed_levels = ["表面的理解", "部分理解", "概念理解", "応用理解"]
+    if level not in allowed_levels:
+        level = "表面的理解"
+
+    correct = level in ["概念理解", "応用理解"]
 
     topic_label = normalize_topic_label(topic)
     update_learning_profile(topic_label, correct)
-    add_learning_log("テスト回答")
 
-    if "不正解" in result or "部分正解" in result:
+    add_learning_log(f"{topic_label} / {level}")
+
+    if level in ["表面的理解", "部分理解"]:
         register_weak_point(topic_label)
 
-    return result
+    return f"評価: {level}\n{comment}"
 
 
-def generate_weak_question(load_weak_points, llm_creative):
+def generate_weak_question(
+    load_weak_points,
+    llm_creative,
+    db,
+    embeddings,
+    retrieve_hits,
+):
     weak = load_weak_points()
     if not weak:
         return None
@@ -241,14 +315,82 @@ def generate_weak_question(load_weak_points, llm_creative):
     weak_sorted = sorted(weak, key=lambda x: x["count"], reverse=True)
     topic = weak_sorted[0]["topic"]
 
+    hits = retrieve_hits(topic, db, embeddings, k=4, only_textbook=True)
+
+    if not hits:
+        return None
+
+    context = "\n\n".join(
+        [f"{format_source_page(d.metadata)}\n{d.page_content[:800]}" for d in hits]
+    )
+
     prompt = f"""
-次のPythonトピックについて理解確認問題を1つ作ってください。
+次の教材内容を根拠に、弱点トピックの理解確認用問題を1つ作ってください。
 
-トピック
+# トピック
 {topic}
-"""
-    return llm_creative.invoke(prompt).content
 
+# 教材
+{context}
+
+# 条件
+・初心者向け
+・短い問題
+・教材の内容に沿って作る
+・模範回答は簡潔にする
+・解説では「なぜその答えになるか」を短く説明する
+・出力は必ずJSONのみ
+・説明文、前置き、コードフェンスは不要
+
+# 出力形式
+{{
+  "question": "問題文",
+  "reference": "模範回答",
+  "explanation": "解説"
+}}
+"""
+
+    result = llm_creative.invoke(prompt).content
+    data = parse_llm_json(result, "弱点問題JSONの解析に失敗しました")
+    data["topic"] = topic
+    data["source"] = "weak_training_rag"
+    data["sources"] = [format_source_page(d.metadata) for d in hits]
+
+    data["source_details"] = []
+    for d in hits[:2]:
+        title = format_source_page(d.metadata)
+        content = d.page_content.strip()
+        preview = content[:800]
+
+        summary_prompt = f"""
+あなたは学習教材の要点整理をするアシスタントです。
+次の教材本文から、トピック「{topic}」の理解に関係ある要点だけを、
+初心者向けに日本語で1〜2文にまとめてください。
+
+# 条件
+・本文の先頭をそのまま切り出すのではなく、関係ある内容を要約する
+・短く自然な文にする
+・出力は要点だけ
+・箇条書きや前置きは不要
+
+# 本文
+{preview}
+"""
+
+        try:
+            summary = llm_creative.invoke(summary_prompt).content.strip()
+        except Exception:
+            summary = preview[:120].replace("\n", " ")
+            if len(preview) > 120:
+                summary += "..."
+
+        data["source_details"].append({
+            "title": title,
+            "summary": summary,
+            "content": preview,
+        })
+
+    return data
 
 def generate_today_mission(load_learning_profile, llm):
     profile = load_learning_profile()
@@ -379,39 +521,30 @@ def generate_next_question(
 
 def generate_drill_question(topic, llm_creative):
     prompt = f"""
-Python学習者向けに
-{topic} の理解度を確認する問題を1つ作ってください。
+次のPythonトピックについて、理解確認用の問題データを1つ作ってください。
 
-条件
-・短い問題
+# トピック
+{topic}
+
+# 条件
 ・初心者向け
-・答えは書かない
+・短い問題
+・出力は必ずJSONのみ
+・説明文やコードフェンスは不要
+
+# 出力形式
+{{
+  "question": "問題文",
+  "reference": "模範回答",
+  "explanation": "解説"
+}}
 """
-    return llm_creative.invoke(prompt).content
 
-
-def recommend_next_topic(load_learning_profile, llm, find_root_weakness):
-    profile = load_learning_profile()
-    if not profile:
-        return "まだ学習データがありません"
-
-    weakest, prereq = find_root_weakness(profile)
-
-    prompt = f"""
-Python学習コーチとして答えてください。
-
-現在の弱点
-{weakest}
-
-前提知識
-{prereq}
-
-次に学ぶべきトピックを
-1つだけ提案してください。
-
-短く答えてください。
-"""
-    return llm.invoke(prompt).content
+    result = llm_creative.invoke(prompt).content
+    data = parse_llm_json(result, "クイックドリルJSONの解析に失敗しました")
+    data["topic"] = topic
+    data["source"] = "quick_drill"
+    return data
 
 
 def generate_adaptive_question(
@@ -446,3 +579,56 @@ Pythonの次のトピックについて理解確認問題を1つ作ってくだ�
 ・コード理解問題
 """
     return llm_creative.invoke(prompt).content
+
+def normalize_topic_from_question(text: str) -> str:
+    if not text:
+        return "未分類"
+
+    topic = text.strip()
+
+    for suffix in [
+        "とは何ですか",
+        "って何ですか",
+        "とは？",
+        "とは",
+        "は何ですか",
+        "を説明してください",
+        "について説明してください",
+        "について教えてください",
+        "を教えてください",
+        "とはどういう意味ですか",
+        "の意味は何ですか",
+        "の意味は？",
+        "とは何か",
+        "とは何？",
+        "？",
+        "?",
+    ]:
+        if topic.endswith(suffix):
+            topic = topic[: -len(suffix)].strip()
+            break
+
+    return topic or text.strip()
+
+def recommend_next_topic(load_learning_profile, llm, find_root_weakness):
+    profile = load_learning_profile()
+    if not profile:
+        return "まだ学習データがありません"
+
+    weakest, prereq = find_root_weakness(profile)
+
+    prompt = f"""
+Python学習コーチとして答えてください。
+
+現在の弱点
+{weakest}
+
+前提知識
+{prereq}
+
+次に学ぶべきトピックを
+1つだけ提案してください。
+
+短く答えてください。
+"""
+    return llm.invoke(prompt).content

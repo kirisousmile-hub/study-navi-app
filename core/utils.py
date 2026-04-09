@@ -1,4 +1,5 @@
 import re
+import streamlit as st
 from pathlib import Path
 from typing import List
 from langchain_core.documents import Document
@@ -66,3 +67,17 @@ def format_sources(docs: List[Document]) -> str:
         lines.append(f"- {label}")
 
     return "\n".join(lines) if lines else "- (なし)"
+
+
+def render_last_answer_block(last_q, last_answer, last_hits, render_sources_block_func) -> None:
+    st.subheader("直前の回答")
+    if last_q:
+        st.caption(f"Q. {last_q}")
+
+    left, right = st.columns([1.2, 1])
+
+    with left:
+        st.write(last_answer)
+
+    with right:
+        render_sources_block_func(last_hits)

@@ -17,7 +17,6 @@ from typing import List
 
 # Third-party libraries
 import streamlit as st
-import streamlit.components.v1 as components
 
 st.set_page_config(
     page_title="Study Navi",
@@ -28,6 +27,8 @@ st.set_page_config(
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.documents import Document
 
+
+
 # Local modules
 from core.knowledge_map import (
     find_root_weakness,
@@ -36,7 +37,7 @@ from core.knowledge_map import (
 
 from core.utils import (
     count_turns,
-    format_sources,
+    format_source_page,
 )
 
 from core.review import (
@@ -64,6 +65,7 @@ from core.learning import (
     generate_next_question,
     generate_drill_question,
     recommend_next_topic,
+    parse_llm_json,
 )
 
 from core.coach import (
@@ -76,6 +78,8 @@ from core.coach import (
     coach_reply,
     delete_wall_fact,
     delete_wall_summary,
+    map_to_course_topic,
+    build_wall_excellent_card,
 )
 
 from core.vector_db import (
@@ -93,6 +97,7 @@ from core.vector_db import (
 
 from core.rag import (
     retrieve_hits,
+    rerank_docs,
     answer_with_rag,
 )
 
@@ -107,6 +112,25 @@ from core.analytics import (
     show_weak_heatmap,
     show_learning_dashboard,
 )
+
+from core.ui_blocks import (
+    render_scroll_to_top_button,
+    render_sources_block,
+    render_last_answer_block,
+    render_self_test_block,
+    render_quick_drill_block,
+    render_deep_learning_block,
+    render_mission_curriculum_block,
+    render_analytics_tab,
+    render_review_tab,
+    render_material_tab,
+    render_weak_training_block,
+    render_coach_sidebar_block,
+    render_coach_summary_actions_block,
+    render_coach_chat_block,
+    render_rag_question_block,
+)
+
 ############################################
 # ENVIRONMENT / MODEL SETTINGS
 ############################################
@@ -172,21 +196,60 @@ AUTO_SUMMARY_TURN = 12
 ############################################
 # HELPER FUNCTIONS
 ############################################
-
+#汎用 helper
 # session_state の初期化
 def init_session_state():
+    # 壁打ちチャット履歴
     if WALL_KEY not in st.session_state:
         st.session_state[WALL_KEY] = []
 
+    # 壁打ち要約
     if WALL_SUMMARY_KEY not in st.session_state:
         st.session_state[WALL_SUMMARY_KEY] = None
 
+    # 壁打ち参照ヒット
     if WALL_HITS_KEY not in st.session_state:
         st.session_state[WALL_HITS_KEY] = []
 
-    if "drill_question" not in st.session_state:
-        st.session_state["drill_question"] = None
+    # クイックドリル
+    if "drill_item" not in st.session_state:
+        st.session_state["drill_item"] = None
 
+    if "drill_result" not in st.session_state:
+        st.session_state["drill_result"] = None
+
+    # AIトレーニング
+    if "duo_item" not in st.session_state:
+        st.session_state["duo_item"] = None
+
+    if "duo_result" not in st.session_state:
+        st.session_state["duo_result"] = None
+
+    # 深掘り学習やループ採点
+    if "loop_question" not in st.session_state:
+        st.session_state["loop_question"] = None
+
+    if "loop_grade_result" not in st.session_state:
+        st.session_state["loop_grade_result"] = None
+
+
+    # セルフテスト
+    if "self_test" not in st.session_state:
+        st.session_state["self_test"] = None
+
+    if "self_test_results" not in st.session_state:
+        st.session_state["self_test_results"] = {}
+
+    # ミッション / カリキュラム
+    if "mission" not in st.session_state:
+        st.session_state["mission"] = None
+
+    if "ai_curriculum" not in st.session_state:
+        st.session_state["ai_curriculum"] = None
+
+    # 分析
+    if "weak_explain" not in st.session_state:
+        st.session_state["weak_explain"] = None
 
 # 学習タブ用の問題生成
 def build_next_question():
@@ -212,7 +275,7 @@ def get_drill_topic() -> str:
 
 
 # 復習カードの採点更新
-def handle_review_score(cards: list[dict], card_id: str, new_score: int):
+def handle_review_score(cards: list[dict], card_id: str, new_score):
     updated = update_review_card_score(cards, card_id, new_score)
     if updated:
         st.success(f"更新しました：score={new_score} / next={updated['next_review_date']}")
@@ -281,6 +344,7 @@ def build_index_result_message(
         f"{chunk_count}チャンク"
     )
 
+
 def show_error(prefix: str, e: Exception) -> None:
     st.error(f"{prefix}: {e}")
     st.code(traceback.format_exc())
@@ -300,114 +364,8 @@ def get_registry_count() -> int | None:
     except Exception:
         return None
 
-def render_self_test_block(test: dict) -> None:
-    st.subheader("自己テスト")
 
-    for i, q in enumerate(test["questions"]):
-        st.markdown(f"### Q{i+1}. {q}")
-        user_key = f"user_answer_{i}"
-        user_answer = st.text_area(
-            "あなたの回答",
-            key=user_key
-        )
-
-        if st.button(f"採点する Q{i+1}", key=f"grade_{i}"):
-            result = grade_answer(
-                q,   # topic
-                q,   # question
-                user_answer,
-                test["answers"][i],
-                LEARNING_DEPS["llm"],
-                LEARNING_DEPS["update_learning_profile"],
-                LEARNING_DEPS["add_learning_log"],
-                LEARNING_DEPS["register_weak_point"]
-            )
-            st.markdown("### AI採点")
-            st.write(result)
-
-def render_quick_drill_block() -> None:
-    st.subheader("🧠 クイック確認ドリル")
-    st.caption("弱点トピックを短い問題で素早く確認する、軽めの反復モードです。")
-
-    if st.button("クイック問題を作成"):
-        topic = get_drill_topic()
-        st.session_state["drill_question"] = generate_drill_question(
-            topic,
-            LLM_CREATIVE
-        )
-
-    if st.session_state["drill_question"]:
-        st.write("### クイック問題")
-        st.write(st.session_state["drill_question"])
-
-        answer = st.text_area("あなたの回答")
-
-        if st.button("回答を採点", key="drill_grade_btn"):
-            grading_prompt = f"""
-次の問題の回答を採点してください。
-
-問題
-{st.session_state["drill_question"]}
-
-回答
-{answer}
-
-出力
-・正解かどうか
-・改善ポイント
-"""
-
-            result = LLM.invoke(grading_prompt).content
-
-            st.write("### AI採点")
-            st.write(result)
-
-        if st.button("次の問題を作成", key="drill_next_btn"):
-            topic = get_drill_topic()
-            st.session_state["drill_question"] = generate_drill_question(
-                topic,
-                LLM_CREATIVE
-            )
-            st.rerun()
-
-def render_last_answer_block(last_q, last_answer, last_hits) -> None:
-    left, right = st.columns([2, 1])
-
-    with left:
-        st.subheader("回答")
-        st.write(last_answer)
-
-        if st.button("📝 直前の回答をカード化"):
-            try:
-                cards = load_review_cards()
-                card = make_review_card(
-                    topic=last_q,
-                    answer=last_answer,
-                    hits=last_hits
-                )
-                cards.append(card)
-                save_review_cards(cards)
-                st.success(f"カード化しました！ id={card['id']}")
-                st.rerun()
-            except Exception as e:
-                show_error("カード化に失敗", e)
-
-        if st.button("🧠 自己テストを作成"):
-            try:
-                test = generate_self_test(last_q, last_hits, LLM_CREATIVE)
-                st.session_state["self_test"] = test
-                st.rerun()
-            except Exception as e:
-                show_error("自己テスト作成に失敗しました", e)
-
-        test = st.session_state.get("self_test")
-        if test:
-            render_self_test_block(test)
-
-    with right:
-        st.subheader("参照（sources）")
-        st.markdown(format_sources(last_hits))
-
+#見た目用
 def inject_dark_css() -> None:
     st.markdown("""
     <style>
@@ -508,6 +466,34 @@ def inject_dark_css() -> None:
     hr {
         border-color: #3a404c !important;
     }
+
+/* コードブロック */
+pre, code {
+    background-color: #2b313c !important;
+    color: #f2f2f2 !important;
+}
+
+pre {
+    border: 1px solid #4b5563 !important;
+    border-radius: 8px !important;
+    padding: 0.75rem !important;
+    overflow-x: auto !important;
+}
+
+/* Streamlitのコード表示 */
+div[data-testid="stCodeBlock"] pre,
+div[data-testid="stCode"] pre {
+    background-color: #2b313c !important;
+    color: #f2f2f2 !important;
+}
+
+/* code内文字 */
+div[data-testid="stCodeBlock"] code,
+div[data-testid="stCode"] code,
+pre code {
+    color: #f2f2f2 !important;
+    background-color: transparent !important;
+}
     </style>
     """, unsafe_allow_html=True)
 
@@ -615,30 +601,6 @@ def inject_light_css() -> None:
     </style>
     """, unsafe_allow_html=True)
 
-def render_scroll_to_top_button() -> None:
-    components.html(
-        """
-        <div style="position: fixed; right: 24px; bottom: 24px; z-index: 99999;">
-            <button
-                onclick="window.parent.scrollTo({top: 0, behavior: 'smooth'});"
-                style="
-                    background: #4f8cff;
-                    color: white;
-                    border: none;
-                    border-radius: 999px;
-                    padding: 10px 14px;
-                    font-size: 14px;
-                    font-weight: bold;
-                    cursor: pointer;
-                    box-shadow: 0 4px 12px rgba(0,0,0,0.25);
-                "
-            >
-                ↑ 上へ
-            </button>
-        </div>
-        """,
-        height=0,
-    )
 
 ############################################
 # APP INITIALIZATION
@@ -673,6 +635,14 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
+    st.subheader("💾 保存先")
+    st.caption("セッション履歴: session_state（一時）")
+    st.caption("長期メモ: data/user/wall_memory.json")
+    st.caption("復習カード: data/user/review_cards.json")
+    st.caption("学習プロフィール: data/user/learning_profile.json")
+    st.caption("弱点記録: data/user/weak_points.json")
+
+    st.divider()
     st.subheader("データ投入")
 
     uploaded = st.file_uploader(
@@ -705,177 +675,71 @@ tabs = st.tabs([
 
 tab_learn, tab_coach, tab_review, tab_analytics, tab_material = tabs
 
+
 ############################################
 # TAB: LEARNING
 ############################################
 with tab_learn:
     st.header("📚 学習")
 
-    # ------------------------------------------
-    # Question with RAG
-    # ------------------------------------------
-    st.divider()
-    st.subheader("質問する")
-
-    only_textbook = st.checkbox("教材（lectures_pdf）だけ検索する", value=True)
-    lesson_filter = st.text_input(
-        "Lessonフィルター（例: 13）",
-        value=""
+    render_rag_question_block(
+        k,
+        db,
+        EMBEDDINGS,
+        LLM,
+        LLM_CREATIVE,
+        WALL_KEY,
+        TURN_LIMIT,
+        has_main_index,
+        answer_with_rag,
+        generate_self_test,
+        render_last_answer_block,
+        render_sources_block,
+        format_source_page,
+        render_self_test_block,
+        LEARNING_DEPS,
+        grade_answer,
+        count_turns,
+        show_error,
     )
-    question = st.text_input("質問（例：Chroma永続化のしくみを自分の言葉で説明したい）", value="")
-
-    ask_disabled = (not question.strip()) or (not has_main_index(db))
-
-    if st.button("質問する", disabled=ask_disabled):
-        try:
-            with st.spinner("検索＆回答中..."):
-                ans, hits = answer_with_rag(
-                    question=question,
-                    db=db,
-                    embeddings=EMBEDDINGS,
-                    llm=LLM,
-                    k=int(k),
-                    only_textbook=only_textbook,
-                    lesson_filter=lesson_filter or None,
-                )
-
-            st.session_state["last_question"] = question
-            st.session_state["last_answer"] = ans
-            st.session_state["last_hits"] = hits
-        except Exception as e:
-            show_error("回答に失敗", e)
-
-    last_q = st.session_state.get("last_question")
-    last_answer = st.session_state.get("last_answer")
-    last_hits = st.session_state.get("last_hits")
-
-    if last_answer:
-        render_last_answer_block(last_q, last_answer, last_hits)
-
-    # 壁打ち履歴の見える化（RAGの下に置くのが分かりやすい）
-    turns, msgs = count_turns(st.session_state[WALL_KEY])
-    st.caption(f"壁打ち履歴: {turns} / {TURN_LIMIT} ターン（メッセージ {msgs}件）")
-
-    st.divider()
-    st.subheader("AIトレーニング")
-
-    if st.button("弱点トレーニングを開始"):
-        q = generate_weak_question(load_weak_points, LLM_CREATIVE)
-
-        if q:
-            st.session_state["duo_question"] = q
-        else:
-            st.warning("まだ弱点がありません")
-
-    duo_q = st.session_state.get("duo_question")
-
-    if duo_q:
-        st.subheader("AIトレーニング問題")
-
-        st.write(duo_q)
-
-        duo_answer = st.text_area("あなたの回答", key="duo_answer")
-
-        if st.button("回答を採点", key="duo_grade_btn"):
-            result = grade_answer(
-                duo_q,   # topic
-                duo_q,   # question
-                duo_answer,
-                "Pythonの正しい説明",
-                LLM,
-                update_learning_profile,
-                add_learning_log,
-                register_weak_point
-            )
-            st.write(result)
-
-    st.divider()
-
-    # 今日のミッション
-    st.subheader("🎯 今日のミッション")
-
-    if st.button("今日のミッションを作成"):
-        mission = generate_today_mission(
+    render_weak_training_block(
+            generate_weak_question,
+            grade_answer,
+            LLM,
+            LLM_CREATIVE,
+            db,
+            EMBEDDINGS,
+            load_weak_points,
+            update_learning_profile,
+            add_learning_log,
+            register_weak_point,
+            retrieve_hits,
+        )
+    render_mission_curriculum_block(
             LEARNING_DEPS["load_learning_profile"],
-            LEARNING_DEPS["llm"]
+            LEARNING_DEPS["llm"],
+            generate_today_mission,
+            recommend_next_topic,
+            generate_ai_curriculum,
+            find_root_weakness,
         )
-
-        st.session_state["mission"] = mission
-
-    if "mission" in st.session_state:
-        st.write(st.session_state["mission"])
-
-    st.divider()
-
-    # AIカリキュラム
-    st.markdown("### 🤖 AIカリキュラム")
-    # ------------------------------------------
-    # Next topic recommendation
-    # ------------------------------------------
-
-    st.markdown("### 🧭 次に学ぶトピック")
-
-    if st.button("次に学ぶ内容を提案"):
-        topic = recommend_next_topic(
-            load_learning_profile=load_learning_profile,
-            llm=LLM,
-            find_root_weakness=find_root_weakness,
+    render_deep_learning_block(
+            build_next_question,
+            grade_answer,
+            LLM,
+            update_learning_profile,
+            add_learning_log,
+            register_weak_point,
         )
-
-        st.success(topic)
-
-    if st.button("今日の学習メニューを作成"):
-        curriculum = generate_ai_curriculum(load_learning_profile, LLM)
-        st.session_state["ai_curriculum"] = curriculum
-
-    curriculum = st.session_state.get("ai_curriculum")
-
-    if curriculum:
-        st.write(curriculum)
-
-    st.subheader("🚀 深掘り学習モード")
-    st.caption("教材をもとに問題・模範回答・解説を生成して、じっくり理解を深めます。")
-
-    if st.button("深掘り学習を開始"):
-        st.session_state["loop_question"] = build_next_question()
-
-    loop_data = st.session_state.get("loop_question")
-
-    if loop_data:
-        st.write("### 深掘り問題")
-        st.write(loop_data["question"])
-
-        loop_answer = st.text_area("あなたの回答", key="loop_answer")
-
-        if st.button("回答を採点", key="loop_grade_btn"):
-            result = grade_answer(
-                loop_data["topic"],
-                loop_data["question"],
-                loop_answer,
-                loop_data["reference"],
-                LLM,
-                update_learning_profile,
-                add_learning_log,
-                register_weak_point
-            )
-
-            st.write("### AI採点")
-            st.write(result)
-
-            st.markdown("### 模範回答")
-            st.write(loop_data["reference"])
-
-            st.markdown("### 解説")
-            st.write(loop_data["explanation"])
-
-        if st.button("次の問題を作成", key="loop_next_btn"):
-            st.session_state["loop_question"] = build_next_question()
-            st.rerun()
-
-    # ------------------------------------------
-    # Quick drill mode
-    # ------------------------------------------
-    render_quick_drill_block()
+    render_quick_drill_block(
+            get_drill_topic,
+            generate_drill_question,
+            grade_answer,
+            LLM_CREATIVE,
+            update_learning_profile,
+            add_learning_log,
+            register_weak_point,
+        )
 
 ############################################
 # TAB: COACH
@@ -886,432 +750,100 @@ with tab_coach:
     colL, colR = st.columns([2, 1])
 
     with colR:
-        wall_mode = st.selectbox(
-            "学習フェーズ",
-            ["A: 用語理解", "B: 設計理解", "C: コード理解"],
-            index=0
-        )
-        wall_only_textbook = st.checkbox(
-            "教材だけ参照",
-            value=True,
-            key="wall_only_textbook"
-        )
-        wall_k = st.number_input(
-            "壁打ち検索k",
-            min_value=2,
-            max_value=8,
-            value=4,
-            step=1,
-            key="wall_k"
-        )
-        use_long_memory = st.checkbox(
-            "長期記憶を使う",
-            value=False,
-            key="use_long_memory"
+        coach_sidebar = render_coach_sidebar_block(
+            build_memory_block,
+            load_wall_memory,
+            delete_wall_fact,
+            delete_wall_summary,
+            add_wall_fact,
+            save_wall_memory,
         )
 
-        st.divider()
-        st.subheader("🧠 覚えさせるメモ（永続）")
-        st.caption("保存済みメモ（直近）")
-        st.caption("壁打ち履歴は一時保存、長期記憶と復習カードはファイル保存です。")
-        st.text_area(
-            "saved_memory",
-            build_memory_block(limit=10, include_facts=True, include_summaries=True),
-            height=180,
-            disabled=True
-        )
-
-        st.divider()
-        st.subheader("🗂 保存済みメモを個別削除")
-
-        mem_data = load_wall_memory()
-
-        facts = mem_data.get("facts", [])
-        summaries = mem_data.get("summaries", [])
-
-        if facts:
-            st.caption("固定メモ")
-            fact_options = {
-                f"{f['id']} | {f['text'][:40]}": f["id"]
-                for f in facts
-            }
-            selected_fact_label = st.selectbox(
-                "削除する固定メモ",
-                options=list(fact_options.keys()),
-                key="delete_fact_select"
-            )
-
-            if st.button("固定メモを削除", key="delete_fact_btn"):
-                ok = delete_wall_fact(fact_options[selected_fact_label])
-                if ok:
-                    st.success("固定メモを削除しました")
-                    st.rerun()
-                else:
-                    st.warning("削除対象が見つかりませんでした")
-
-        if summaries:
-            st.caption("学習要約")
-            summary_options = {
-                f"{s['id']} | {s['text'][:40].replace(chr(10), ' ')}": s["id"]
-                for s in summaries
-            }
-            selected_summary_label = st.selectbox(
-                "削除する学習要約",
-                options=list(summary_options.keys()),
-                key="delete_summary_select"
-            )
-
-            if st.button("学習要約を削除", key="delete_summary_btn"):
-                ok = delete_wall_summary(summary_options[selected_summary_label])
-                if ok:
-                    st.success("学習要約を削除しました")
-                    st.rerun()
-                else:
-                    st.warning("削除対象が見つかりませんでした")
-
-        mem_text = st.text_input(
-            "覚えてほしいこと（例：合言葉はリンゴ）",
-            key="mem_text"
-        )
-
-        colm1, colm2 = st.columns(2)
-        with colm1:
-            if st.button("➕ メモを保存", key="save_mem_btn"):
-                if mem_text.strip():
-                    f = add_wall_fact(mem_text)
-                    st.success(f"保存しました id={f['id']}")
-                    st.rerun()
-                else:
-                    st.warning("空です")
-
-        with colm2:
-            if st.button("🗑 メモ全消し（危険）", key="clear_mem_btn"):
-                save_wall_memory({"facts": [], "summaries": []})
-                st.warning("全メモを削除しました")
-                st.rerun()
+    wall_mode = coach_sidebar["wall_mode"]
+    wall_only_textbook = coach_sidebar["wall_only_textbook"]
+    wall_k = coach_sidebar["wall_k"]
+    use_long_memory = coach_sidebar["use_long_memory"]
 
     with colL:
-        st.caption("あなたが喋る → 根拠を差し込む → 質問で掘る、の順で進めます。")
-
-        chat_area = st.container(height=600, border=True)
-
-        with chat_area:
-            for m in st.session_state[WALL_KEY]:
-                with st.chat_message(m["role"]):
-                    st.write(m["content"])
-
-        user_msg = st.chat_input(
-            "いま何を復習したい？（例：for文 / 関数 / 例外 / import / 合言葉確認）"
+        render_coach_chat_block(
+            coach_sidebar["wall_mode"],
+            coach_sidebar["wall_only_textbook"],
+            coach_sidebar["wall_k"],
+            coach_sidebar["use_long_memory"],
+            db,
+            EMBEDDINGS,
+            LLM,
+            AUTO_SUMMARY_TURN,
+            WALL_KEY,
+            WALL_HITS_KEY,
+            WALL_SUMMARY_KEY,
+            map_to_course_topic,
+            retrieve_hits,
+            rerank_docs,
+            coach_reply,
+            summarize_wall_history,
+            add_wall_summary,
+            render_sources_block,
+            format_source_page,
         )
 
-        if user_msg:
-            st.session_state[WALL_KEY].append(
-                {"role": "user", "content": user_msg}
-            )
-
-            hits = retrieve_hits(
-                user_msg,
-                db,
-                EMBEDDINGS,
-                k=int(wall_k),
-                only_textbook=wall_only_textbook
-            )
-            st.session_state[WALL_HITS_KEY] = hits
-
-            assistant_msg = coach_reply(
-                st.session_state[WALL_KEY],
-                hits,
-                wall_mode,
-                LLM,
-                use_long_memory=use_long_memory
-            )
-
-            st.session_state[WALL_KEY].append(
-                {"role": "assistant", "content": assistant_msg}
-            )
-
-            turns = len(st.session_state[WALL_KEY]) // 2
-
-            if turns >= AUTO_SUMMARY_TURN:
-                summary_text = summarize_wall_history(
-                    st.session_state[WALL_KEY],
-                    hits,
-                    LLM
-                )
-
-                add_wall_summary(summary_text)
-
-                st.session_state[WALL_SUMMARY_KEY] = summary_text
-
-                st.session_state[WALL_KEY] = [
-                    {
-                        "role": "assistant",
-                        "content": "ここまでの壁打ち内容を自動要約して長期記憶に保存しました。続きをどうぞ。"
-                    }
-                ]
-
-            st.rerun()
-
-        hits = st.session_state.get(WALL_HITS_KEY, [])
-        if hits:
-            with st.expander("参照（sources）"):
-                st.markdown(format_sources(hits))
-
-    st.divider()
-    colA, colB = st.columns(2)
-
-    with colA:
-        if st.button("🧾 壁打ちまとめを作成"):
-            hist = st.session_state[WALL_KEY]
-            hits = st.session_state.get(WALL_HITS_KEY, [])
-
-            summary_text = summarize_wall_history(
-                hist,
-                hits,
-                LLM
-            )
-
-            st.session_state[WALL_SUMMARY_KEY] = summary_text
-            add_wall_summary(summary_text)
-            st.rerun()
-
-    with colB:
-        if st.button("🗑 壁打ちをリセット"):
-            st.session_state[WALL_KEY] = []
-            st.session_state.pop(WALL_SUMMARY_KEY, None)
-            st.session_state.pop(WALL_HITS_KEY, None)
-            st.rerun()
-
-    summary = st.session_state.get(WALL_SUMMARY_KEY)
-    if summary:
-        st.subheader("まとめ")
-        st.write(summary)
-        if st.button("📝 壁打ちまとめをカード化"):
-            cards = load_review_cards()
-            card = make_review_card(
-                topic="壁打ちまとめ",
-                answer=summary,
-                hits=st.session_state.get(WALL_HITS_KEY, []),
-            )
-            cards.append(card)
-            save_review_cards(cards)
-            st.success(f"カード化しました！ id={card['id']}")
-            st.rerun()
-
-    st.caption(f"壁打ち履歴: {len(st.session_state[WALL_KEY])} メッセージ")
+    render_coach_summary_actions_block(
+        WALL_KEY,
+        WALL_SUMMARY_KEY,
+        WALL_HITS_KEY,
+        summarize_wall_history,
+        add_wall_summary,
+        load_review_cards,
+        save_review_cards,
+        make_review_card,
+        build_wall_excellent_card,
+        LLM,
+        show_error,
+    )
 
 ############################################
 # TAB: REVIEW
 ############################################
 with tab_review:
-    st.header("📝 復習")
-    # ------------------------------------------
-    # Review cards
-    # ------------------------------------------
-
-    cards = load_review_cards()
-    if not cards:
-        st.info("まだカードがありません。まずは学習タブで質問 → 回答 → 『📝 直前の回答をカード化』を押してください。")
-    else:
-        today = datetime.now().strftime("%Y-%m-%d")
-        only_due = st.checkbox("今日の復習だけ表示する（next_review_date <= 今日）", value=True)
-
-        filtered = [c for c in cards if (is_due(c, today) if only_due else True)]
-        st.write(f"カード数: {len(cards)} / 表示: {len(filtered)}（今日={today}）")
-
-        sort_key = st.selectbox("並び順", ["next_review_dateが古い順", "作成日時が新しい順"], index=0)
-        if sort_key == "next_review_dateが古い順":
-            filtered.sort(key=lambda c: c.get("next_review_date") or "0000-00-00")
-        else:
-            filtered.sort(key=lambda c: c.get("created_at") or "", reverse=True)
-
-        options = [
-            f"{c.get('id','????')} | {c.get('next_review_date','-')} | {c.get('topic','(no topic)')[:50]}"
-            for c in filtered
-        ]
-        sel = st.selectbox("カードを選択", options, index=0)
-        sel_id = sel.split("|")[0].strip()
-        card = next((c for c in cards if c.get("id") == sel_id), None)
-
-        if not card:
-            st.error("カードが見つかりませんでした（データ不整合の可能性）。")
-        else:
-            st.subheader("問題（自分で答えてから開く）")
-            st.write(card.get("question") or card.get("topic"))
-
-            show_answer = st.checkbox("答えを表示する", value=False)
-            if show_answer:
-                st.subheader("答え（保存された回答）")
-                st.write(card.get("answer", ""))
-
-                st.subheader("参照（sources）")
-                srcs = card.get("sources", [])
-                if srcs:
-                    st.markdown("\n".join([f"- {s}" for s in srcs]))
-                else:
-                    st.write("(なし)")
-
-            st.divider()
-            st.subheader("採点して次回復習日を更新")
-
-            col1, col2, col3 = st.columns(3)
-
-            with col1:
-                if st.button("0 😵 無理（明日）"):
-                    handle_review_score(cards, card["id"], 0)
-
-            with col2:
-                if st.button("1 🤔 微妙（2日後）"):
-                    handle_review_score(cards, card["id"], 1)
-
-            with col3:
-                if st.button("2 ✅ できた（1週間後）"):
-                    handle_review_score(cards, card["id"], 2)
-
-            st.divider()
-            st.subheader("管理")
-            if st.button("このカードを削除（危険）"):
-                cards2 = [c for c in cards if c.get("id") != card.get("id")]
-                save_review_cards(cards2)
-                st.warning("削除しました。")
-                st.rerun()
-
-            st.divider()
-            st.subheader("弱点トピック")
-
-            weak = load_weak_points()
-
-            if weak:
-                weak_sorted = sorted(weak, key=lambda x: x["count"], reverse=True)
-
-                for w in weak_sorted[:5]:
-                    st.write(f"{w['topic']} （{w['count']}回ミス）")
-
-            else:
-                st.caption("まだ弱点はありません")
-
+    render_review_tab(
+        load_review_cards,
+        save_review_cards,
+        is_due,
+        handle_review_score,
+        load_weak_points,
+        datetime.now,
+    )
 ############################################
 # TAB: ANALYTICS
 ############################################
 with tab_analytics:
-    st.header("📊 分析")
-
-    show_learning_dashboard(load_learning_profile)
-    show_weak_heatmap(load_learning_profile, get_weak_topics_sorted)
-
-    show_knowledge_map()
-
-    st.subheader("🧠 弱点分析")
-
-    if st.button("弱点の原因を分析"):
-        explanation = explain_weakness(
-            LEARNING_DEPS["load_learning_profile"],
-            LEARNING_DEPS["llm"]
-        )
-        st.session_state["weak_explain"] = explanation
-
-    explanation = st.session_state.get("weak_explain")
-
-    if explanation:
-        st.write(explanation)
-
-    st.divider()
-
-    st.subheader("🏆 学習レベル")
-
-    level = get_learning_level(load_learning_profile)
-
-    st.write(level)
-
-    st.subheader("🧑‍🏫 AI学習アドバイス")
-
-    if st.button("学習状況を分析"):
-        profile = load_learning_profile()
-
-        if not profile:
-            st.info("まだ学習データがありません")
-        else:
-            summary = []
-
-            for topic, data in profile.items():
-                total = data["total"]
-                correct = data["correct"]
-                score = correct / total if total else 0
-                summary.append(f"{topic}:{round(score*100)}%")
-
-            prompt = f"""
-Python学習コーチとして
-次の学習データを分析してください。
-
-{summary}
-
-・現在の理解度
-・弱点
-・次の学習アドバイス
-
-を短く説明してください。
-"""
-            advice = LLM.invoke(prompt).content
-            st.write(advice)
+    render_analytics_tab(
+        LEARNING_DEPS["load_learning_profile"],
+        LEARNING_DEPS["llm"],
+        show_learning_dashboard,
+        show_weak_heatmap,
+        get_weak_topics_sorted,
+        show_knowledge_map,
+        explain_weakness,
+        get_learning_level,
+    )
 
 ############################################
 # TAB: MATERIALS
 ############################################
 with tab_material:
-    st.header("📂 教材管理")
-    # ------------------------------------------
-    # Build or update index
-    # ------------------------------------------
-    local_paths = collect_local_files()
-
-    if st.button("インデックスを作成（追加）"):
-        try:
-            saved_paths: List[Path] = []
-            if uploaded:
-                saved_paths = save_uploaded_files(uploaded)
-
-            local_paths = collect_local_files()
-
-            candidate_paths: List[Path] = [*saved_paths, *local_paths]
-
-            target_paths, skipped = split_target_and_skipped_paths(candidate_paths)
-
-            raw_docs = load_documents_from_paths(target_paths)
-
-            chunks = split_docs(raw_docs)
-
-            if len(chunks) == 0:
-                st.success(
-                    build_index_result_message(
-                        saved_paths=saved_paths,
-                        local_paths=local_paths,
-                        target_paths=target_paths,
-                        skipped=skipped,
-                        chunk_count=0,
-                    )
-                )
-                show_skipped_files(skipped)
-            else:
-                before = get_db(EMBEDDINGS)._collection.count()
-
-                build_or_update_vectorstore(chunks, EMBEDDINGS)
-
-                after = get_db(EMBEDDINGS)._collection.count()
-                st.info(f"Chroma count: {before} -> {after} (+{after - before})")
-
-                mark_indexed_paths(target_paths)
-
-                st.success(
-                    build_index_result_message(
-                        saved_paths=saved_paths,
-                        local_paths=local_paths,
-                        target_paths=target_paths,
-                        skipped=skipped,
-                        chunk_count=len(chunks),
-                    )
-                )
-
-                show_skipped_files(skipped)
-
-        except Exception as e:
-            show_error("インデックス作成に失敗", e)
+    render_material_tab(
+        uploaded,
+        collect_local_files,
+        save_uploaded_files,
+        EMBEDDINGS,
+        get_db,
+        build_or_update_vectorstore,
+        split_target_and_skipped_paths,
+        load_documents_from_paths,
+        split_docs,
+        build_index_result_message,
+        show_skipped_files,
+        mark_indexed_paths,
+        show_error,
+    )
